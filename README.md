@@ -7,9 +7,11 @@
 ## Table of contents
 
 - [Overview](#overview)
+- [Prerequisites](#prerequisites)
 - [Architecture](#architecture)
 - [Quick start](#quick-start)
 - [What the solution deploys](#what-the-solution-deploys)
+- [How uptime is calculated](#how-uptime-is-calculated)
 - [What app owners change](#what-app-owners-change)
 - [Repository layout](#repository-layout)
 - [Documentation](#documentation)
@@ -24,7 +26,18 @@ Most teams monitoring a public application rely on shallow load balancer or cont
 - **A dedicated deep health endpoint** doing a bounded, read-only dependency check on a replica/reader, isolated so monitoring never disturbs real users.
 - **A real SLA %** computed as a count-ratio `100 × SUM(2xx) / (SUM(2xx) + SUM(Failed))` on an Amazon CloudWatch dashboard (or Amazon Managed Grafana), with Amazon SNS alerts. It is exact across days and months, and immune to run-cadence changes.
 
+**Why not just use existing health checks?** Load balancer and container health checks only confirm a process is alive and a port is open — they don't exercise your backend. Amazon Route 53 health checks probe from outside but typically hit a shallow endpoint, not a real dependency path. A hand-rolled cron prober means reinventing scheduling, retries, metric publishing, alerting, and traffic isolation. This solution gets the outside-in vantage *and* a genuine end-to-end dependency check, packaged as reusable infrastructure-as-code.
+
 The canary is a managed AWS Lambda function that CloudWatch Synthetics runs **in your own account**. It supports two networking modes with a single parameter: **non-VPC** (public endpoints, the default) and **VPC mode** (private endpoints).
+
+## Prerequisites
+
+- An **AWS account** with permissions for Amazon CloudWatch Synthetics, CloudWatch alarms/dashboards, Amazon SNS, Amazon S3, AWS WAF, and AWS IAM.
+- The **AWS CLI** installed and configured for your target account and Region.
+- **Git** and **Bash** (to clone the repo and run `deploy.sh`).
+- An application with an **HTTPS deep-health endpoint** — or use the bundled [`sample-app/`](sample-app/). For **VPC mode** only: private subnets with egress to CloudWatch and Amazon S3 (a NAT Gateway, or S3 + `monitoring`/`logs` VPC endpoints).
+
+Full details in [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ## Architecture
 
@@ -54,6 +67,15 @@ bash deploy.sh --target-url https://your-app/health/deep --stack-name deep-healt
 
 It prints the dashboard name, monitored URL, and SNS topic when done. Open the CloudWatch dashboard (named after your stack) and, after a few runs, `SuccessPercent` sits at 100% and the cumulative **uptime %** widget populates.
 
+**Verify it works.** Open the **CloudWatch dashboard** (named after your stack) — after a few runs, `SuccessPercent` shows 100% and the cumulative **uptime %** widget populates. In **CloudWatch → Application Signals → Synthetics Canaries**, open any run to see its steps, screenshots, and HAR.
+
+**Prove a failure is caught.** With the sample app deployed, induce a real dependency failure and watch the canary flip to failing (and the alarm fire), then recover:
+
+```bash
+bash test/break-dependency.sh      # deletes the sample app's health sentinel → 503
+bash test/restore-dependency.sh    # re-seeds it → back to healthy
+```
+
 > **One knob to know:** `SloMs` (default **3000 ms**) is the full response time a user experiences, **including any backend cold start** — cold-start slowness correctly counts against uptime rather than being hidden. Tighten it for a warm, steady-traffic service.
 
 **→ Full deployment guide: [`DEPLOYMENT.md`](DEPLOYMENT.md)** — prerequisites, the deep-health endpoint contract, all deploy methods (guided / one-shot root stack / CloudFormation / CDK), the parameters reference, VPC vs non-VPC (with the egress precheck), retargeting, and teardown.
@@ -70,6 +92,18 @@ The infrastructure-as-code provisions the **monitoring stack only** — it does 
 6. **Amazon SNS topic** — breach notifications.
 7. **Amazon CloudWatch dashboard** — uptime %, latency, and pass/fail counts.
 8. **AWS WAF rate-based rule** — protects the health path.
+
+**Cost:** roughly **$10/month per monitored endpoint** at a 5-minute cadence (about $52/month at 1-minute); VPC mode adds a NAT Gateway unless you use VPC endpoints.
+
+## How uptime is calculated
+
+Every canary run publishes `SuccessPercent`, `2xx`, `Failed`, and `Duration` to the `CloudWatchSynthetics` namespace (note: it emits a `2xx` count, **not** a `Passed` metric). The dashboard computes availability as a **count-ratio** over whatever time range you're viewing:
+
+```
+Availability % = 100 × SUM(2xx) / ( SUM(2xx) + SUM(Failed) )
+```
+
+Because it's a ratio of counts (not an average of percentages), it's **exact across any window** — an outage on day 50 still shows correctly when you look on day 90 — and **immune to run-cadence changes** (1-minute vs. 5-minute probing). The uptime widget uses `setPeriodToTimeRange` so it recomputes for the selected range rather than a fixed period.
 
 ## What app owners change
 
