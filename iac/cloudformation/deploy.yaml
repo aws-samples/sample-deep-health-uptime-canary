@@ -88,5 +88,3 @@ Outputs:
     Value: !GetAtt MonitoringStack.Outputs.DashboardName
   AlarmTopicArn:
     Value: !GetAtt MonitoringStack.Outputs.AlarmTopicArn
-  WebACLArn:
-    Value: !GetAtt MonitoringStack.Outputs.WebACLArn

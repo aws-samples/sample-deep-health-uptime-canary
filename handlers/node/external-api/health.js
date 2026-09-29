@@ -31,6 +31,8 @@ function probeUpstream(url, timeoutMs) {
 }
 
 app.get('/health/deep', async (req, res) => {
+  // Never let a CDN/proxy cache a health response — a cached 200 would mask a real outage.
+  res.set('Cache-Control', 'no-store');
   const t0 = Date.now();
   const timeoutMs = parseInt(process.env.UPSTREAM_TIMEOUT_MS || '1000', 10);
 
@@ -45,5 +47,12 @@ app.get('/health/deep', async (req, res) => {
     latencyMs: Date.now() - t0,
   });
 });
+
+// Run standalone (node health.js) for local testing against test/contract_test.py.
+// When imported (e.g. into your app), this block is skipped and `app` is exported.
+if (require.main === module) {
+  const port = parseInt(process.env.PORT || '8080', 10);
+  app.listen(port, () => console.log(`deep-health handler listening on :${port}`));
+}
 
 module.exports = app;

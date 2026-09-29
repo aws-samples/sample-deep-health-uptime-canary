@@ -4,26 +4,51 @@ Description: >-
   endpoint with a CloudWatch Synthetics canary, and reports it as an SLA percentage
   with alarms.
 
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Target and schedule }
+        Parameters: [ TargetUrl, CanaryName, ScheduleExpression, SloMs ]
+      - Label: { default: Alarms }
+        Parameters: [ AlarmEmail ]
+      - Label: { default: VPC mode (private endpoints only - leave blank for public) }
+        Parameters: [ VpcId, VpcSubnetIds, CanarySecurityGroupId ]
+    ParameterLabels:
+      TargetUrl: { default: Deep-health endpoint URL to probe }
+      CanaryName: { default: Resource name prefix (<=21 chars) }
+      ScheduleExpression: { default: Probe schedule }
+      SloMs: { default: End-to-end latency SLO (ms) }
+      AlarmEmail: { default: Alarm notification email (optional) }
+      VpcId: { default: VPC ID (VPC mode) }
+      VpcSubnetIds: { default: Private subnet IDs (VPC mode) }
+      CanarySecurityGroupId: { default: Existing security group ID (optional) }
+
 Parameters:
   TargetUrl:
     Type: String
+    AllowedPattern: '^https?://.+'
+    ConstraintDescription: Must be a full http(s) URL, e.g. https://app.example.com/health/deep
     Description: Full public URL the canary probes, e.g. https://app.example.com/health/deep
   CanaryName:
     Type: String
     Default: deep-health
     AllowedPattern: '[0-9a-z_-]{1,21}'
     Description: >-
-      Prefix for ALL resource names in this stack (canary, alarms, dashboard, SNS,
-      WAF). The root stack passes the stack name here, so '--stack-name deep-health'
+      Prefix for ALL resource names in this stack (canary, alarms, dashboard, SNS).
+      The root stack passes the stack name here, so '--stack-name deep-health'
       names everything 'deep-health-*'. Must be <=21 chars, lowercase/digits/-/_
       (the 21-char cap is the Synthetics canary-name limit). Override to rename.
   ScheduleExpression:
     Type: String
     Default: rate(5 minutes)
+    AllowedPattern: '^(rate\(.+\)|cron\(.+\))$'
+    ConstraintDescription: Must be a rate(...) or cron(...) expression, e.g. rate(5 minutes).
     Description: Canary schedule. Between rate(1 minute) and rate(1 hour).
   SloMs:
     Type: Number
     Default: 3000
+    MinValue: 1
+    MaxValue: 30000
     Description: >-
       End-to-end latency SLO in milliseconds. The canary fails a run if the FULL response
       time (as a user experiences it, INCLUDING any backend cold start) exceeds this. Set
@@ -118,8 +143,8 @@ Resources:
               - Effect: Allow
                 Action: [ s3:PutObject, s3:GetBucketLocation ]
                 Resource:
-                  - !Sub 'arn:aws:s3:::${ArtifactBucket}'
-                  - !Sub 'arn:aws:s3:::${ArtifactBucket}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/*'
               - Effect: Allow
                 Action: [ cloudwatch:PutMetricData ]
                 Resource: '*'
@@ -127,7 +152,7 @@ Resources:
                   StringEquals: { 'cloudwatch:namespace': CloudWatchSynthetics }
               - Effect: Allow
                 Action: [ logs:CreateLogStream, logs:PutLogEvents, logs:CreateLogGroup ]
-                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cwsyn-*'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cwsyn-*'
               - !If
                 - IsVpcMode
                 - Effect: Allow
@@ -159,33 +184,67 @@ Resources:
         Script: |
           const synthetics = require('@aws/synthetics-puppeteer');
           const log = require('@aws/synthetics-logger');
-          const https = require('https');
 
+          // Uses the INSTRUMENTED HTTP step so the library emits the request-level
+          // 2xx/4xx/5xx metrics + per-step Duration + a HAR. A raw https.get would
+          // publish none of those, leaving the uptime widget blank. Availability on
+          // the dashboard is computed from SuccessPercent (run-level), not from the
+          // per-request 2xx count. Keep in sync with canary/deep-health.js.
           const deepHealthCheck = async function () {
             const url = process.env.TARGET_URL;
             const sloMs = parseInt(process.env.SLO_MS || '3000', 10);
-            const start = Date.now();
+            if (!url) throw new Error('TARGET_URL environment variable is required');
 
-            const body = await new Promise((resolve, reject) => {
-              const req = https.get(url, { headers: { 'X-Synthetic': 'true' } }, (res) => {
+            const u = new URL(url);
+            const requestOptions = {
+              hostname: u.hostname,
+              method: 'GET',
+              path: `${u.pathname}${u.search}`,
+              port: u.port || (u.protocol === 'https:' ? 443 : 80),
+              protocol: u.protocol,
+              headers: { 'X-Synthetic': 'true' },
+            };
+            const stepConfig = {
+              includeRequestHeaders: true,
+              includeResponseHeaders: true,
+              includeRequestBody: false,
+              includeResponseBody: true,
+              continueOnHttpStepFailure: false,
+            };
+
+            let capturedBody = '';
+            const start = Date.now();
+            const validate = async function (res) {
+              return await new Promise((resolve, reject) => {
                 let data = '';
                 res.on('data', (c) => { data += c; });
                 res.on('end', () => {
-                  if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode}`)); return; }
-                  resolve(data);
+                  capturedBody = data;
+                  if (res.statusCode < 200 || res.statusCode > 299) {
+                    reject(new Error(`Unhealthy: HTTP ${res.statusCode}`));
+                    return;
+                  }
+                  resolve();
                 });
+                res.on('error', reject);
               });
-              req.on('error', reject);
-              req.setTimeout(10000, () => { req.destroy(new Error('request timeout')); });
-            });
+            };
+
+            await synthetics.executeHttpStep('deep-health', requestOptions, validate, stepConfig);
 
             const latency = Date.now() - start;
-            log.info(`round-trip ${latency}ms (SLO ${sloMs}ms)`);
+            log.info(`Deep health round-trip: ${latency}ms (SLO ${sloMs}ms)`);
             if (latency > sloMs) throw new Error(`Latency ${latency}ms exceeds SLO ${sloMs}ms`);
+
+            let parsed;
             try {
-              const parsed = JSON.parse(body);
-              if (parsed.status !== 'ok') throw new Error(`degraded: ${JSON.stringify(parsed)}`);
-            } catch (e) { throw new Error(`invalid health payload: ${e.message}`); }
+              parsed = JSON.parse(capturedBody);
+            } catch (e) {
+              throw new Error(`Invalid health payload (not JSON): ${e.message}`);
+            }
+            if (parsed.status !== 'ok') {
+              throw new Error(`Endpoint reported degraded: ${JSON.stringify(parsed)}`);
+            }
           };
 
           exports.handler = async () => { return await deepHealthCheck(); };
@@ -223,7 +282,9 @@ Resources:
       EvaluationPeriods: 1
       Threshold: 100
       ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
+      # 'missing' (not 'breaching') so schedules slower than the 5-min period do not
+      # sit in permanent ALARM on periods that legitimately have no run datapoint.
+      TreatMissingData: missing
       AlarmActions: [ !Ref AlarmTopic ]
       OKActions: [ !Ref AlarmTopic ]
 
@@ -232,12 +293,15 @@ Resources:
     Properties:
       AlarmName: !Sub '${CanaryName}-latency'
       AlarmDescription: >-
-        End-to-end response time (canary run Duration, which includes any backend cold
-        start — the real time a user waits) stayed above the SLO for 3 consecutive runs.
+        HTTP round-trip time of the deep-health step (the real end-to-end time a user waits,
+        including any backend cold start) stayed above the SLO for 3 consecutive runs. Uses the
+        per-step Duration (StepName=deep-health), NOT the whole-canary run Duration, so canary
+        runtime boot time does not trip the alarm.
       Namespace: CloudWatchSynthetics
       MetricName: Duration
       Dimensions:
         - { Name: CanaryName, Value: !Ref CanaryName }
+        - { Name: StepName, Value: deep-health }
       Statistic: Average
       Period: 300
       EvaluationPeriods: 3
@@ -246,36 +310,6 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions: [ !Ref AlarmTopic ]
-
-  HealthRateLimitWebACL:
-    Type: AWS::WAFv2::WebACL
-    Properties:
-      Name: !Sub '${CanaryName}-health-ratelimit'
-      Scope: REGIONAL
-      DefaultAction: { Allow: {} }
-      VisibilityConfig:
-        SampledRequestsEnabled: true
-        CloudWatchMetricsEnabled: true
-        MetricName: !Sub '${CanaryName}healthAcl'
-      Rules:
-        - Name: rate-limit-health
-          Priority: 0
-          Action: { Block: {} }
-          VisibilityConfig:
-            SampledRequestsEnabled: true
-            CloudWatchMetricsEnabled: true
-            MetricName: !Sub '${CanaryName}rlHealth'
-          Statement:
-            RateBasedStatement:
-              Limit: 100
-              AggregateKeyType: IP
-              ScopeDownStatement:
-                ByteMatchStatement:
-                  FieldToMatch: { UriPath: {} }
-                  PositionalConstraint: STARTS_WITH
-                  SearchString: /health/deep
-                  TextTransformations:
-                    - { Priority: 0, Type: NONE }
 
   UptimeDashboard:
     Type: AWS::CloudWatch::Dashboard
@@ -296,8 +330,8 @@ Resources:
             {
               "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
               "properties": {
-                "title": "End-to-end latency (Duration ms)",
-                "metrics": [[ "CloudWatchSynthetics", "Duration", "CanaryName", "${CanaryName}" ]],
+                "title": "End-to-end latency \u2014 HTTP round-trip (ms)",
+                "metrics": [[ "CloudWatchSynthetics", "Duration", "CanaryName", "${CanaryName}", "StepName", "deep-health" ]],
                 "view": "timeSeries", "stat": "Average", "period": 300, "region": "${AWS::Region}"
               }
             },
@@ -306,9 +340,7 @@ Resources:
               "properties": {
                 "title": "Cumulative uptime %",
                 "metrics": [
-                  [ "CloudWatchSynthetics", "2xx", "CanaryName", "${CanaryName}", { "id": "p", "visible": false, "stat": "Sum" } ],
-                  [ "CloudWatchSynthetics", "Failed", "CanaryName", "${CanaryName}", { "id": "f", "visible": false, "stat": "Sum" } ],
-                  [ { "expression": "100*p/(p+f)", "label": "Uptime %", "id": "u" } ]
+                  [ "CloudWatchSynthetics", "SuccessPercent", "CanaryName", "${CanaryName}", { "label": "Uptime %", "stat": "Average" } ]
                 ],
                 "view": "singleValue", "setPeriodToTimeRange": true, "region": "${AWS::Region}"
               }
@@ -322,39 +354,6 @@ Resources:
                   [ "CloudWatchSynthetics", "Failed", "CanaryName", "${CanaryName}", { "stat": "Sum", "label": "Failed" } ]
                 ],
                 "view": "timeSeries", "period": 300, "region": "${AWS::Region}"
-              }
-            },
-            {
-              "type": "text", "x": 0, "y": 12, "width": 24, "height": 3,
-              "properties": {
-                "markdown": "**Latency breakdown (diagnostic)** — from the target app's EMF metrics (`DeepHealth/Breakdown`): WHY latency is high — total in-handler time vs. dependency-query round-trip. The uptime SLO is still judged end-to-end (above). For **cold-start** time, use the Logs Insights query in the tile to the right — it reads Lambda's real `@initDuration`. `TotalMs`/`DbQueryMs` populate on any compute; on EC2/ECS/Fargate there is no per-request cold start."
-              }
-            },
-            {
-              "type": "metric", "x": 0, "y": 13, "width": 12, "height": 6,
-              "properties": {
-                "title": "Latency breakdown over time (ms)",
-                "metrics": [
-                  [ "DeepHealth/Breakdown", "TotalMs", "Service", "deep-health-sample", { "stat": "Average", "label": "Total (in-handler) ms" } ],
-                  [ "DeepHealth/Breakdown", "DbQueryMs", "Service", "deep-health-sample", { "stat": "Average", "label": "DB query ms" } ]
-                ],
-                "view": "timeSeries", "period": 300, "region": "${AWS::Region}"
-              }
-            },
-            {
-              "type": "text", "x": 18, "y": 13, "width": 6, "height": 6,
-              "properties": {
-                "markdown": "**Cold start (real number)**\n\nLambda's own `@initDuration` is the authoritative cold-start time. In **CloudWatch \u2192 Logs Insights**, select your app's log group and run:\n\n```\nfilter @type=\"REPORT\" | filter ispresent(@initDuration)\n| stats avg(@initDuration) as avgMs, max(@initDuration) as maxMs, count() as coldStarts by bin(1h)\n```"
-              }
-            },
-            {
-              "type": "metric", "x": 12, "y": 13, "width": 6, "height": 6,
-              "properties": {
-                "title": "DB query (ms, avg)",
-                "metrics": [
-                  [ "DeepHealth/Breakdown", "DbQueryMs", "Service", "deep-health-sample", { "stat": "Average" } ]
-                ],
-                "view": "singleValue", "period": 300, "region": "${AWS::Region}"
               }
             }
           ]
@@ -373,6 +372,3 @@ Outputs:
     Value: !Ref AlarmTopic
   ArtifactBucketName:
     Value: !Ref ArtifactBucket
-  WebACLArn:
-    Description: Associate this Web ACL with your ALB/CloudFront to rate-limit /health/deep.
-    Value: !GetAtt HealthRateLimitWebACL.Arn

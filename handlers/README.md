@@ -25,6 +25,19 @@ GET /health/deep
 3. **Bounded, dedicated resource** — a tiny separate connection pool (max 1–2) or a client with `maxAttempts: 1`, so the probe can never starve real user traffic.
 4. **Tight timeout** — 1s connect/command timeout so a slow dependency fails the check fast rather than hanging the endpoint.
 
+## Access and synthetic-traffic tagging
+
+Two things worth deciding when you copy a handler into your app:
+
+- **The endpoint is public and unauthenticated by default.** The canary calls it anonymously,
+  so keep the response coarse (`{"status":"ok"}` / `{"status":"degraded",...}`) and never leak
+  hostnames, versions, or connection strings. If you need it closed, require a shared-secret
+  header on this path and inject the same value into the canary (see DEPLOYMENT.md).
+- **`X-Synthetic: true` is a tag, not an action.** The canary sends this header so *you can
+  exclude* probe traffic from your real-user latency metrics/logs — but your app has to actually
+  do the excluding (filter it in your metric/RUM pipeline). The reference handlers and the sample
+  app do **not** filter it for you; it's there so you can.
+
 ## Latency breakdown metrics (optional, diagnostic)
 
 The canary measures the **full end-to-end time** a user waits — but from its
@@ -39,8 +52,10 @@ latency, no SDK dependency):
 | `DbQueryMs` | the dependency probe round-trip (the handler already measures this) |
 | `TotalMs` | total in-handler time |
 
-All three land in namespace **`DeepHealth/Breakdown`** (dimension `Service`), and
-the monitoring stack's dashboard has a **Latency breakdown** row that charts them.
+Both land in namespace **`DeepHealth/Breakdown`** (dimension `Service`, default
+`deep-health`; override with the `METRIC_SERVICE` env var). They are **not** on the
+monitoring dashboard by default — view them in **CloudWatch → Metrics** under
+`DeepHealth/Breakdown`, or add your own widget filtered to your `Service` value.
 These are **diagnostic only** — the uptime SLO is still judged end-to-end by the
 canary; the breakdown just explains the number, it doesn't change it.
 

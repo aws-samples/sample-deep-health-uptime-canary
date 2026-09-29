@@ -55,14 +55,26 @@ if [[ -z "${TABLE}" ]]; then
   # 1) Try the named stack (works for a standalone sample-app deploy).
   TABLE="$(aws cloudformation describe-stacks --stack-name "${SAMPLE_STACK}" --region "${REGION}" \
     --query "Stacks[0].Outputs[?OutputKey=='HealthTableName'].OutputValue" --output text 2>/dev/null || true)"
-  # 2) Fall back: scan ALL stacks for a HealthTableName output (catches the nested
-  #    stack's auto-generated name under the root deploy).
+  # 2) Fall back: scan only the DESCENDANTS of the target root stack for a
+  #    HealthTableName output (catches the sample app deployed as a NESTED stack
+  #    with an auto-generated name). Scoping to descendants avoids clobbering a
+  #    sentinel in an unrelated stack when several deployments share the account.
   if [[ -z "${TABLE}" || "${TABLE}" == "None" ]]; then
-    TABLE="$(aws cloudformation describe-stacks --region "${REGION}" \
-      --query "Stacks[].Outputs[?OutputKey=='HealthTableName'].OutputValue" --output text 2>/dev/null \
-      | tr '\t' '\n' | grep -v '^$' | grep -v '^None$' | head -n1 || true)"
+    # Nested stacks carry a RootId pointing at the root stack's ARN. Find the root
+    # stack ARN for SAMPLE_STACK, then match child stacks whose RootId equals it.
+    ROOT_ID="$(aws cloudformation describe-stacks --stack-name "${SAMPLE_STACK}" --region "${REGION}" \
+      --query "Stacks[0].StackId" --output text 2>/dev/null || true)"
+    if [[ -n "${ROOT_ID}" && "${ROOT_ID}" != "None" ]]; then
+      # List stacks whose RootId is our root, then read HealthTableName from each.
+      for child in $(aws cloudformation list-stacks --region "${REGION}" \
+        --query "StackSummaries[?RootId=='${ROOT_ID}'].StackName" --output text 2>/dev/null | tr '\t' '\n'); do
+        TABLE="$(aws cloudformation describe-stacks --stack-name "${child}" --region "${REGION}" \
+          --query "Stacks[0].Outputs[?OutputKey=='HealthTableName'].OutputValue" --output text 2>/dev/null || true)"
+        [[ -n "${TABLE}" && "${TABLE}" != "None" ]] && break
+      done
+    fi
   fi
-  [[ -n "${TABLE}" && "${TABLE}" != "None" ]] || die "Could not auto-discover the sample-app table (searched stack '${SAMPLE_STACK}' and all stacks' HealthTableName outputs). Pass --table <name> (find it with: aws dynamodb list-tables --region ${REGION})."
+  [[ -n "${TABLE}" && "${TABLE}" != "None" ]] || die "Could not auto-discover the sample-app table under stack '${SAMPLE_STACK}' (or its nested stacks). Pass --table <name> (find it with: aws dynamodb list-tables --region ${REGION})."
 fi
 
 echo "Breaking dependency: deleting sentinel '${SENTINEL_ID}' from table '${TABLE}' (${REGION}) ..."

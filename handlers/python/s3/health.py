@@ -30,7 +30,9 @@ HEALTH_KEY = os.environ["HEALTH_KEY"]
 
 
 @app.get("/health/deep")
-async def health_deep(response: Response):
+def health_deep(response: Response):
+    # Never let a CDN/proxy cache a health response — a cached 200 would mask a real outage.
+    response.headers["Cache-Control"] = "no-store"
     t0 = time.monotonic()
     try:
         _s3.head_object(Bucket=HEALTH_BUCKET, Key=HEALTH_KEY)   # metadata only

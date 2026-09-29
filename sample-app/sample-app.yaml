@@ -48,7 +48,7 @@ Resources:
         Version: '2012-10-17'
         Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
         - PolicyName: seed-put
           PolicyDocument:
@@ -58,7 +58,9 @@ Resources:
 
   SeedFunction:
     Type: AWS::Lambda::Function
+    DependsOn: SeedFunctionLogGroup
     Properties:
+      FunctionName: !Sub '${NamePrefix}-seed'
       Runtime: nodejs22.x
       Handler: index.handler
       Timeout: 30
@@ -93,7 +95,7 @@ Resources:
         Version: '2012-10-17'
         Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
         - PolicyName: health-read
           PolicyDocument:
@@ -104,7 +106,9 @@ Resources:
 
   AppFunction:
     Type: AWS::Lambda::Function
+    DependsOn: AppFunctionLogGroup
     Properties:
+      FunctionName: !Sub '${NamePrefix}-app'
       Runtime: nodejs22.x
       Handler: index.handler
       Timeout: 10
@@ -174,6 +178,19 @@ Resources:
             }
           };
 
+  # Explicit log groups with retention so the sample never accrues logs forever.
+  SeedFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-seed'
+      RetentionInDays: 14
+
+  AppFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefix}-app'
+      RetentionInDays: 14
+
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
     Properties:
@@ -187,7 +204,7 @@ Resources:
       Action: lambda:InvokeFunction
       FunctionName: !Ref AppFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
 
 Outputs:
   SampleAppUrl:

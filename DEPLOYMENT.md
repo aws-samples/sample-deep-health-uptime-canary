@@ -5,7 +5,7 @@ End-to-end steps to stand up the deep-health uptime monitoring stack.
 ## Prerequisites
 
 - An application with a public (or, for VPC mode, private) HTTPS endpoint.
-- Permissions to deploy CloudFormation/CDK, Synthetics, CloudWatch, SNS, S3, WAF, IAM.
+- Permissions to deploy CloudFormation, Synthetics, CloudWatch, SNS, S3, IAM.
 - The **AWS CLI** configured for your target account. The solution deploys to your configured default Region (resolved from `--region`, then `AWS_REGION`/`AWS_DEFAULT_REGION`, then `aws configure get region`); if none is set, `deploy.sh` stops and asks you to set one.
 - (VPC mode only) private subnets and — for canary egress — a NAT Gateway, or S3 + CloudWatch interface VPC endpoints.
 
@@ -84,7 +84,7 @@ aws cloudformation deploy \
 
 > **Tags.** Stack-level `--tags` propagate to every taggable resource in the root **and** nested stacks. `deploy.sh` applies the `project` and `managed-by` tags automatically (add more with `--tag KEY=VALUE`); if you deploy by hand, include the `--tags` line above.
 
-### Option A — CloudFormation (monitoring stack on its own)
+### Deploy the monitoring stack directly with CloudFormation
 
 Non-VPC (public endpoint, recommended):
 
@@ -116,28 +116,44 @@ aws cloudformation deploy \
       CanarySecurityGroupId=sg-0abc123
 ```
 
-### Option B — CDK
+## Protecting the health path (recommended)
 
-See [`iac/cdk/README.md`](iac/cdk/README.md). In short:
+The `/health/deep` endpoint is public. Rate-limiting it at your edge is a good
+practice — it is **your application's** responsibility, not the monitor's, so the
+monitoring stack does not create a Web ACL for you. Add an AWS WAF rate-based rule
+scoped to the health path on whatever fronts your app:
 
-```bash
-cd iac/cdk && npm install
-npx cdk deploy -c targetUrl=https://app.example.com/health/deep -c alarmEmail=you@example.com
-```
+- **ALB, REST API Gateway, or AppSync** — create a **REGIONAL** Web ACL with a
+  rate-based rule (scope-down on the URI path) and associate it:
+  ```bash
+  aws wafv2 associate-web-acl \
+    --web-acl-arn <your-regional-web-acl-arn> \
+    --resource-arn <your-ALB-or-apigw-stage-or-appsync-arn>
+  ```
+- **Amazon CloudFront** — create the Web ACL with **CLOUDFRONT** scope (in
+  `us-east-1`) and attach it to the distribution instead.
 
-## Step 4 — Associate the WAF Web ACL
+Note that a REGIONAL Web ACL cannot attach to an API Gateway **HTTP API** (only a
+REST API) — the bundled sample app uses an HTTP API, so it is intentionally left
+without a WAF. See the Security section of the blog for the full rationale.
 
-The stack creates a REGIONAL Web ACL that rate-limits `/health/deep` (output `WebACLArn`). Associate it with your ALB or CloudFront distribution:
+### The health endpoint is public and unauthenticated
 
-```bash
-aws wafv2 associate-web-acl \
-  --web-acl-arn <WebACLArn-from-stack-output> \
-  --resource-arn <your-ALB-ARN>
-```
+By design the canary probes `/health/deep` over plain HTTPS with no credentials, so the
+endpoint must be reachable anonymously. Two things follow, and both are your call:
+
+- **Keep the response low-detail for anonymous callers.** The reference handlers return a
+  coarse status (`{"status":"ok"}` / `{"status":"degraded","db":"timeout"}`) — enough for the
+  canary, without leaking topology. Avoid returning stack traces, hostnames, versions, or
+  connection strings from this path.
+- **Require a shared secret if you need to.** If you don't want the path open, have the handler
+  require a header (e.g. `X-Health-Key: <value>`) and inject the same value into the canary via a
+  RunConfig environment variable, so only the canary can exercise it. (The bundled sample keeps it
+  open for simplicity.)
 
 ## Step 5 — Confirm
 
-- Open the **`<canaryName>-uptime` CloudWatch dashboard** — `SuccessPercent` should be 100%, and the cumulative uptime % widget (count-ratio `100*SUM(2xx)/(SUM(2xx)+SUM(Failed))`) populates after a few runs.
+- Open the **`<canaryName>-uptime` CloudWatch dashboard** — `SuccessPercent` should be 100%, and the cumulative uptime % widget (`AVG(SuccessPercent)` over the selected range) populates after a few runs.
 - Confirm the SNS email subscription (check your inbox) so alarms notify you.
 - Optionally force a failure with the sample app: `bash test/break-dependency.sh` (deletes the DynamoDB sentinel → 503), then `bash test/restore-dependency.sh` to recover.
 
@@ -145,7 +161,7 @@ aws wafv2 associate-web-acl \
 
 The canary measures the **full end-to-end time** a user waits (the right number for the SLO) — but from outside it can't tell whether a slow run was a **Lambda cold start** or a **slow dependency query**. Two ways to see the split:
 
-**1. Dashboard — the "Latency breakdown" row (out of the box with the sample app).** The target app emits two CloudWatch metrics via EMF (namespace `DeepHealth/Breakdown`, dimension `Service`): `DbQueryMs` (the dependency round-trip) and `TotalMs` (in-handler total). To get the same breakdown from **your own** app, add the ~3-line EMF snippet to your handler — see [`handlers/README.md`](handlers/README.md#latency-breakdown-metrics-optional-diagnostic) and the drop-in helpers `handlers/node/emf.js` / `handlers/python/emf.py`. (CDK: point the widgets at your service with `-c breakdownService=<your-service>`.)
+**1. EMF breakdown metrics (opt-in, any compute).** Emit two CloudWatch metrics from inside your handler via EMF (namespace `DeepHealth/Breakdown`, dimension `Service`): `DbQueryMs` (the dependency round-trip) and `TotalMs` (in-handler total). Add the ~3-line EMF snippet to your handler — see [`handlers/README.md`](handlers/README.md#latency-breakdown-metrics-optional-diagnostic) and the drop-in helpers `handlers/node/emf.js` / `handlers/python/emf.py`. These are **not** on the monitoring dashboard by default — view them in **CloudWatch → Metrics** under `DeepHealth/Breakdown` (filter to your `Service` value, default `deep-health`; the sample app uses `deep-health-sample`), or add your own widget.
 
 > **`TotalMs`/`DbQueryMs` populate on any compute** (Lambda, EC2, ECS, Fargate), giving the **app-vs-dependency** split. For the reference **ECS + Aurora** architecture, `DbQueryMs` (the Aurora `SELECT 1` round-trip) is the metric that matters. **Cold-start** time is not synthesized in-handler — read it from Lambda's real `@initDuration` (next).
 
@@ -162,16 +178,16 @@ filter @type = "REPORT"
 
 ## Parameters reference
 
-| Parameter (CFN / CDK context) | Default | Notes |
+| Parameter | Default | Notes |
 |---|---|---|
-| `TargetUrl` / `targetUrl` | — | Full `/health/deep` URL (required) |
-| `CanaryName` / `canaryName` | `deep-health` | ≤21 chars |
-| `ScheduleExpression` / `schedule` | `rate(5 minutes)` | `rate(1 minute)`–`rate(1 hour)` |
-| `SloMs` / `sloMs` | `3000` | End-to-end latency budget (ms), incl. any cold start |
-| `AlarmEmail` / `alarmEmail` | — | SNS email subscription |
-| `VpcSubnetIds` / `subnetIds` | — | Enables VPC mode when set (comma-separated; 2+ in different AZs recommended) |
-| `VpcId` / `vpcId` | — | VPC for the created canary SG. Required in VPC mode unless `CanarySecurityGroupId` is given |
-| `CanarySecurityGroupId` / `securityGroupId` | — | Optional. Existing `sg-…` to use; omit and the stack creates one (egress 443) |
+| `TargetUrl` | — | Full `/health/deep` URL (required) |
+| `CanaryName` | `deep-health` | ≤21 chars |
+| `ScheduleExpression` | `rate(5 minutes)` | `rate(1 minute)`–`rate(1 hour)` |
+| `SloMs` | `3000` | End-to-end latency budget (ms), incl. any cold start |
+| `AlarmEmail` | — | SNS email subscription |
+| `VpcSubnetIds` | — | Enables VPC mode when set (comma-separated; 2+ in different AZs recommended) |
+| `VpcId` | — | VPC for the created canary SG. Required in VPC mode unless `CanarySecurityGroupId` is given |
+| `CanarySecurityGroupId` | — | Optional. Existing `sg-…` to use; omit and the stack creates one (egress 443) |
 
 ## Retargeting the canary to a new URL
 
@@ -188,7 +204,7 @@ The URL the canary probes is the `TargetUrl` stack parameter, set at deploy time
    ```
    `--target-url` implies "no sample app." Passing the same `--stack-name` updates the existing stack rather than creating a new one.
 3. **What happens to the sample app.** If the stack previously deployed the sample app, setting `DeploySampleApp=no` (which `--target-url` implies) removes the nested sample-app stack automatically as part of the same update. Nothing to clean up by hand.
-4. **Verify** on the dashboard that the monitored URL is now your endpoint. The dashboard, alarms, SNS topic, and WAF rule are unchanged — only the target moved.
+4. **Verify** on the dashboard that the monitored URL is now your endpoint. The dashboard, alarms, and SNS topic are unchanged — only the target moved.
 
 ## VPC vs non-VPC — and running both
 
@@ -249,6 +265,26 @@ bash deploy.sh --stack-name deep-health-private \
 ```
 
 Every resource is prefixed with the stack name, so the two deployments coexist with no collisions. Compare them: if the public canary fails while the private one stays green, the fault is at the edge (DNS, TLS, CloudFront, routing); if both fail, it's in the backend.
+
+## Cost
+
+Indicative **us-east-1** pricing for one deep-health canary. Cost is dominated by how often
+the canary runs; everything else is cents.
+
+| Component | At `rate(5 minutes)` | At `rate(1 minute)` | Notes |
+|---|---|---|---|
+| Synthetics canary runs | ~$10/mo | ~$52/mo | ~$0.0012 per run; 8,640 vs 43,200 runs/mo |
+| CloudWatch alarms | ~$0.30/mo | ~$0.30/mo | 2 alarms x $0.10, plus rounding |
+| CloudWatch dashboard | $0–3/mo | $0–3/mo | First 3 dashboards free, then $3 each |
+| Amazon S3 (run artifacts) | cents | cents | HAR/logs/screenshots; a 31-day lifecycle rule expires them |
+| **Typical total** | **~$10–13/mo** | **~$52–55/mo** | **per monitored endpoint** |
+
+Notes:
+- **Start at `rate(5 minutes)`** (~$10/mo) and move to 1-minute only if you need sub-5-minute detection.
+- **VPC mode** adds a **NAT Gateway (~$32/mo)** unless you use S3 + CloudWatch/logs **VPC endpoints** instead — share one NAT across all canaries if you go that route.
+- The optional **sample app** is pay-per-request and **≈ $0 at rest**.
+- If you add a **WAF** rate-limit rule at your edge (recommended), a Web ACL bills ~$5/mo + $1/rule, independent of this stack.
+- Always confirm against the current [CloudWatch pricing](https://aws.amazon.com/cloudwatch/pricing/) for your Region.
 
 ## Teardown
 

@@ -27,7 +27,9 @@ _client = redis.Redis.from_url(
 
 
 @app.get("/health/deep")
-async def health_deep(response: Response):
+def health_deep(response: Response):
+    # Never let a CDN/proxy cache a health response — a cached 200 would mask a real outage.
+    response.headers["Cache-Control"] = "no-store"
     t0 = time.monotonic()
     try:
         if _client.ping() is not True:           # trivial, read-only

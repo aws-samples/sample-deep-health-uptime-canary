@@ -126,19 +126,19 @@ if [[ -t 0 && "${STACK_EXISTS}" == "no" ]]; then
           read -r -p "Is that endpoint public or private? [public/private] (public): " _ans
           case "${_ans}" in
             private|PRIVATE|priv|p)
-              echo "  VPC mode: the canary runs inside your VPC and needs egress to CloudWatch/S3 \u2014 a NAT Gateway route, or S3 + CloudWatch/logs VPC endpoints \u2014 or its runs will fail. This is checked before deploy."
+              echo "  VPC mode: the canary runs inside your VPC and needs egress to CloudWatch/S3 - a NAT Gateway route, or S3 + CloudWatch/logs VPC endpoints - or its runs will fail. This is checked before deploy."
               # VPC ID (needed so the stack can create the canary security group).
               while [[ ! "${VPC_ID}" =~ ^vpc-[0-9a-f]{8,}$ ]]; do
                 read -r -p "  VPC ID (vpc-...): " VPC_ID
                 [[ "${VPC_ID}" =~ ^vpc-[0-9a-f]{8,}$ ]] || echo "    Enter a valid VPC ID like vpc-0123456789abcdef0."
               done
-              # Private subnet IDs \u2014 at least one; recommend 2+ in different AZs.
+              # Private subnet IDs - at least one; recommend 2+ in different AZs.
               while true; do
                 read -r -p "  Private subnet IDs (comma-separated, 2+ in different AZs recommended): " VPC_SUBNETS
                 if [[ "${VPC_SUBNETS}" =~ ^subnet-[0-9a-f]{8,}(,subnet-[0-9a-f]{8,})*$ ]]; then break; fi
                 echo "    Enter one or more subnet IDs like subnet-0123...,subnet-0456... (no spaces)."
               done
-              # Security group: optional \u2014 blank means the stack CREATES one (egress 443).
+              # Security group: optional - blank means the stack CREATES one (egress 443).
               while true; do
                 read -r -p "  Security group ID [blank = create one for you]: " SECURITY_GROUP
                 [[ -z "${SECURITY_GROUP}" ]] && { echo "    Will create a canary security group (egress 443) in ${VPC_ID}."; break; }
@@ -187,7 +187,7 @@ if [[ "${STACK_EXISTS}" == "no" && "${DEPLOY_SAMPLE}" == "no" && -z "${TARGET_UR
   die "Provide --target-url <url>, or use --sample-app to deploy and monitor the bundled sample app."
 fi
 
-# All resource names derive from the stack name (canary, alarms, dashboard, SNS, WAF,
+# All resource names derive from the stack name (canary, alarms, dashboard, SNS,
 # sample-app API, DynamoDB table). The AWS Synthetics canary name is the tightest
 # constraint: <=21 chars, lowercase letters/digits/-/_ only. Validate up front and
 # fail fast with a clear message rather than letting AWS reject it mid-deploy.
@@ -363,6 +363,7 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
   --parameter-overrides "${PARAMS[@]}" \
   --tags "${TAGS[@]}" \
+  --no-fail-on-empty-changeset \
   --region "${REGION}"
 
 echo ""
@@ -371,4 +372,4 @@ aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${REGI
   --query "Stacks[0].Outputs[].{Key:OutputKey,Value:OutputValue}" --output table
 
 echo ""
-echo "Tip: open the CloudWatch dashboard 'deep-health-uptime' (or your --stack-name) to watch SuccessPercent and the uptime %."
+echo "Tip: open the CloudWatch dashboard '${STACK_NAME}-uptime' to watch SuccessPercent and the uptime %."

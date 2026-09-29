@@ -16,7 +16,7 @@
 #   -h | --help           Show this help.
 #
 # Note: the root stack owns the nested sample-app and monitoring stacks, so
-# deleting it removes them too (canary, alarms, SNS, dashboard, WAF, Lambda,
+# deleting it removes them too (canary, alarms, SNS, dashboard, Lambda,
 # API Gateway, DynamoDB). CloudFormation cannot delete a non-empty S3 bucket, so
 # this script first EMPTIES the canary artifact bucket(s) — otherwise the stack
 # delete fails with DELETE_FAILED on ArtifactBucket.

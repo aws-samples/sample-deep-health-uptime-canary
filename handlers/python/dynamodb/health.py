@@ -8,11 +8,15 @@ the data plane instead, swap in a get_item on a tiny sentinel key.
 Env: HEALTH_TABLE, AWS_REGION
 """
 import os
+import sys
 import time
 import boto3
 from botocore.config import Config
 from fastapi import FastAPI, Response
-# Optional latency-breakdown metrics (query / total; cold start via @initDuration). See ../emf.py.
+# Optional latency-breakdown metrics (query / total; cold start via @initDuration).
+# emf.py lives in handlers/python/ (one directory up) — put it on the path so this
+# handler imports cleanly whether run from its own dir or the handlers root.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from emf import emit_breakdown
 
 app = FastAPI()
@@ -27,7 +31,9 @@ HEALTH_TABLE = os.environ["HEALTH_TABLE"]
 
 
 @app.get("/health/deep")
-async def health_deep(response: Response):
+def health_deep(response: Response):
+    # Never let a CDN/proxy cache a health response — a cached 200 would mask a real outage.
+    response.headers["Cache-Control"] = "no-store"
     t0 = time.monotonic()
     try:
         q0 = time.monotonic()
