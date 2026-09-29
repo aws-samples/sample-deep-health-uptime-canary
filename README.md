@@ -33,7 +33,7 @@ The canary is a managed AWS Lambda function that CloudWatch Synthetics runs **in
 ## Prerequisites
 
 - An **AWS account** with permissions for Amazon CloudWatch Synthetics, CloudWatch alarms/dashboards, Amazon SNS, Amazon S3, AWS WAF, and AWS IAM.
-- The **AWS CLI** installed and configured for your target account and Region.
+- The **AWS CLI** installed and configured for your target account and Region. The solution deploys to your configured default Region (from `AWS_REGION`/`AWS_DEFAULT_REGION` or `aws configure`) unless you pass `--region`.
 - **Git** and **Bash** (to clone the repo and run `deploy.sh`).
 - An application with an **HTTPS deep-health endpoint** — or use the bundled [`sample-app/`](sample-app/). For **VPC mode** only: private subnets with egress to CloudWatch and Amazon S3 (a NAT Gateway, or S3 + `monitoring`/`logs` VPC endpoints).
 

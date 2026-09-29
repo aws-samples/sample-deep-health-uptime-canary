@@ -6,6 +6,7 @@ End-to-end steps to stand up the deep-health uptime monitoring stack.
 
 - An application with a public (or, for VPC mode, private) HTTPS endpoint.
 - Permissions to deploy CloudFormation/CDK, Synthetics, CloudWatch, SNS, S3, WAF, IAM.
+- The **AWS CLI** configured for your target account. The solution deploys to your configured default Region (resolved from `--region`, then `AWS_REGION`/`AWS_DEFAULT_REGION`, then `aws configure get region`); if none is set, `deploy.sh` stops and asks you to set one.
 - (VPC mode only) private subnets and — for canary egress — a NAT Gateway, or S3 + CloudWatch interface VPC endpoints.
 
 > **Canary runtime:** the stack pins `syn-nodejs-puppeteer-17.0` (Node.js 22.x) and the script uses the current `@aws/synthetics-*` namespace (`@aws/synthetics-puppeteer`, `@aws/synthetics-logger`), introduced in `syn-nodejs-puppeteer-13.1`. It is **not** compatible with runtimes older than 13.1 or with the Playwright runtimes — if you change the runtime, keep the script's `require(...)` namespace in sync.
