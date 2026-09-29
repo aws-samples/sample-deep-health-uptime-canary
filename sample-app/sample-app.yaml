@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  deep-health-uptime-canary — OPTIONAL sample target application.
+  A fully serverless, pay-per-request app you can deploy to try the monitoring
+  solution end to end: an API Gateway HTTP API → Lambda → DynamoDB (on-demand),
+  exposing a /health/deep endpoint that does a real dependency round trip.
+
+  Cost: ~$0 at rest. Lambda + API Gateway + DynamoDB on-demand are all
+  pay-per-request with no idle/hourly charge, so it is safe to leave running.
+  (The monitoring canary you point at it is the only ongoing cost — see the
+  main solution.) This sample demonstrates the Lambda + DynamoDB path; the
+  reference "hero" architecture is ECS + Aurora, but the /health/deep contract
+  and the canary are identical.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: deep-health
+    Description: >-
+      Prefix for named resources (e.g. the HTTP API). The root stack passes the
+      stack name, so everything is named '<stack>-...'.
+  TableName:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional explicit DynamoDB table name. Leave empty to let CloudFormation
+      auto-name it. The root deploy stack passes a clean stack-based name
+      (e.g. <root-stack>-health) so the table is easy to find and collision-safe.
+
+Conditions:
+  HasTableName: !Not [ !Equals [ !Ref TableName, '' ] ]
+
+Resources:
+
+  HealthTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !If [ HasTableName, !Ref TableName, !Ref 'AWS::NoValue' ]
+      BillingMode: PAY_PER_REQUEST          # on-demand — $0 at rest
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+
+  # Seed a sentinel item so /health/deep can do a real GetItem round trip.
+  SeedItem:
+    Type: Custom::SeedItem
+    Properties:
+      ServiceToken: !GetAtt SeedFunction.Arn
+      TableName: !Ref HealthTable
+
+  SeedFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: seed-put
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: [ dynamodb:PutItem ], Resource: !GetAtt HealthTable.Arn }
+
+  SeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt SeedFunctionRole.Arn
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+          const https = require('https');
+          const send = (event, ctx, status, data) => new Promise((res) => {
+            const body = JSON.stringify({ Status: status, PhysicalResourceId: 'seed', StackId: event.StackId,
+              RequestId: event.RequestId, LogicalResourceId: event.LogicalResourceId, Data: data || {} });
+            const u = new URL(event.ResponseURL);
+            const req = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'PUT',
+              headers: { 'content-type': '', 'content-length': body.length } }, () => res());
+            req.on('error', () => res()); req.write(body); req.end();
+          });
+          exports.handler = async (event, ctx) => {
+            try {
+              if (event.RequestType !== 'Delete') {
+                const ddb = new DynamoDBClient({});
+                await ddb.send(new PutItemCommand({ TableName: event.ResourceProperties.TableName,
+                  Item: { id: { S: 'health-sentinel' }, ok: { BOOL: true } } }));
+              }
+              await send(event, ctx, 'SUCCESS');
+            } catch (e) { await send(event, ctx, 'FAILED', { error: String(e) }); }
+          };
+
+  AppFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: health-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Least-privilege, read-only: the health probe only needs GetItem/DescribeTable.
+              - { Effect: Allow, Action: [ dynamodb:GetItem, dynamodb:DescribeTable ], Resource: !GetAtt HealthTable.Arn }
+
+  AppFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt AppFunctionRole.Arn
+      Environment:
+        Variables:
+          HEALTH_TABLE: !Ref HealthTable
+          SENTINEL_ID: health-sentinel
+          METRIC_NAMESPACE: DeepHealth/Breakdown
+      Code:
+        ZipFile: |
+          // Sample /health/deep — read-only GetItem on a sentinel key (single-digit ms).
+          // Mirrors handlers/node/dynamodb with the standard contract.
+          //
+          // Latency breakdown: this handler emits three CloudWatch metrics via EMF
+          // (Embedded Metric Format — just a structured log line, no extra API call,
+          // no added request latency):
+          //   ColdStartMs — Lambda init/cold-start overhead (emitted only on the cold invoke)
+          //   DbQueryMs   — the dependency (DynamoDB GetItem) round-trip time
+          //   TotalMs     — total in-handler time
+          // These are DIAGNOSTIC only; the uptime SLO is still judged end-to-end by the
+          // canary. They let you see WHY latency is high (cold start vs. slow query).
+          // Container-init timestamp. On a COLD container the module is loaded fresh, so
+          // this is set at init; the gap between it and the first invocation captures the
+          // cold-container warm-up the user actually waits through. (Lambda's own
+          // `@initDuration` in the REPORT log line is the authoritative init number — see
+          // the Logs Insights query in DEPLOYMENT.md; this metric is the in-handler proxy.)
+          const INIT_START = Date.now();           // set once at container init (cold only)
+          const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
+          const ddb = new DynamoDBClient({ maxAttempts: 1 });
+          let isCold = true;                       // true only on the first invoke of a fresh container
+          // Emit a metric via EMF. metrics = [{name, value, unit}]; dims picked up from properties.
+          // NOTE: this sample hardcodes the Service dimension to 'deep-health-sample', which is
+          // exactly what the dashboard's latency-breakdown widgets query. Your OWN app, using the
+          // shared handlers/node/emf.js helper, defaults the Service dimension to 'deep-health'
+          // (override with the METRIC_SERVICE env var). If you retarget the canary at your app and
+          // want the breakdown widgets to show its data, set METRIC_SERVICE to match the value the
+          // dashboard queries (or edit the dashboard's Service dimension). This affects only the
+          // diagnostic breakdown row — never the uptime verdict, which the canary judges end-to-end.
+          function emit(metrics, props) {
+            const ns = process.env.METRIC_NAMESPACE || 'DeepHealth/Breakdown';
+            const rec = { _aws: { Timestamp: Date.now(), CloudWatchMetrics: [ {
+              Namespace: ns, Dimensions: [['Service']],
+              Metrics: metrics.map((m) => ({ Name: m.name, Unit: m.unit || 'Milliseconds' })) } ] },
+              Service: 'deep-health-sample', ...props };
+            for (const m of metrics) rec[m.name] = m.value;
+            console.log(JSON.stringify(rec));
+          }
+          exports.handler = async (event) => {
+            const path = event.rawPath || (event.requestContext && event.requestContext.http && event.requestContext.http.path) || '/';
+            const t0 = Date.now();
+            if (path !== '/health/deep') {
+              return { statusCode: 200, headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ app: 'sample', message: 'ok — try /health/deep' }) };
+            }
+            const coldThisInvoke = isCold;
+            isCold = false;                         // subsequent invokes on this container are warm
+            // On the cold invoke, the container warm-up the user waited through is the gap
+            // from container init to now. 0 on warm invokes.
+            const coldStartMs = coldThisInvoke ? (t0 - INIT_START) : 0;
+            try {
+              const q0 = Date.now();
+              const out = await ddb.send(new GetItemCommand({ TableName: process.env.HEALTH_TABLE,
+                Key: { id: { S: process.env.SENTINEL_ID } } }));
+              const dbQueryMs = Date.now() - q0;
+              if (!out.Item) throw new Error('sentinel item missing');
+              const totalMs = Date.now() - t0;
+              // Diagnostic breakdown metrics. ColdStartMs only on the cold invoke.
+              const metrics = [ { name: 'DbQueryMs', value: dbQueryMs }, { name: 'TotalMs', value: totalMs } ];
+              if (coldThisInvoke) metrics.push({ name: 'ColdStartMs', value: coldStartMs });
+              emit(metrics, { coldStart: coldThisInvoke });
+              return { statusCode: 200, headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ status: 'ok', db: 'ok', latencyMs: totalMs,
+                  dbQueryMs, coldStart: coldThisInvoke, coldStartMs }) };
+            } catch (e) {
+              const kind = /timeout/i.test(String(e)) ? 'timeout' : 'error';
+              return { statusCode: 503, headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ status: 'degraded', db: kind, latencyMs: Date.now() - t0 }) };
+            }
+          };
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${NamePrefix}-sample-api'
+      ProtocolType: HTTP
+      Target: !GetAtt AppFunction.Arn
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AppFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+Outputs:
+  SampleAppUrl:
+    Description: Base URL of the sample app. The canary target is this + /health/deep.
+    Value: !GetAtt HttpApi.ApiEndpoint
+  HealthDeepUrl:
+    Description: Pass this as TargetUrl to the monitoring stack.
+    Value: !Sub '${HttpApi.ApiEndpoint}/health/deep'
+  HealthTableName:
+    Value: !Ref HealthTable

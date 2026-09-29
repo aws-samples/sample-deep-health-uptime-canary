@@ -1,0 +1,19 @@
+{
+  "name": "deep-health-uptime-handlers-node",
+  "version": "1.0.0",
+  "description": "Reference /health/deep endpoint handlers (Node.js) for the deep-health-uptime-canary solution. Copy the folder matching your datastore into your app.",
+  "license": "MIT-0",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "4.19.2",
+    "pg": "8.11.5",
+    "redis": "4.6.13",
+    "mongodb": "6.5.0",
+    "@aws-sdk/client-dynamodb": "3.540.0",
+    "@aws-sdk/client-s3": "3.540.0"
+  },
+  "comment": "This manifest lists dependencies across ALL Node reference handlers. A given handler only needs a subset: express + (pg | redis | mongodb | @aws-sdk/client-dynamodb | @aws-sdk/client-s3). external-api and opensearch use only Node built-ins (https) + express."
+}

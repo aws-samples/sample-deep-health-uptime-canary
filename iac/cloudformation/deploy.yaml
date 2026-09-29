@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  deep-health-uptime-canary — one-shot root stack. Optionally deploys the sample
+  target app and wires its /health/deep URL straight into the monitoring stack,
+  so you don't have to copy any values between stacks. Set DeploySampleApp=yes to
+  deploy the sample app + monitoring together; set DeploySampleApp=no and provide
+  TargetUrl to monitor your own existing endpoint.
+
+  NESTED STACKS require the child templates in S3. Package once, then deploy:
+    aws cloudformation package \
+      --template-file iac/cloudformation/deploy.yaml \
+      --s3-bucket <YOUR_ARTIFACT_BUCKET> \
+      --output-template-file packaged.yaml
+    aws cloudformation deploy \
+      --template-file packaged.yaml \
+      --stack-name deep-health-uptime \
+      --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+      --parameter-overrides DeploySampleApp=yes AlarmEmail=you@example.com
+
+Parameters:
+  DeploySampleApp:
+    Type: String
+    AllowedValues: [ 'yes', 'no' ]
+    Default: 'no'
+    Description: >-
+      "yes" = also deploy the serverless sample app (~$0 at rest) and monitor it
+      automatically. "no" = monitor your own endpoint (provide TargetUrl).
+  TargetUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      Your /health/deep URL. REQUIRED when DeploySampleApp=no. Ignored when
+      DeploySampleApp=yes (the sample app's URL is wired in automatically).
+  ScheduleExpression:
+    Type: String
+    Default: rate(5 minutes)
+  SloMs:
+    Type: Number
+    Default: 3000
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional email subscribed to the alarm SNS topic.
+  # VPC mode (optional; only meaningful for your own private endpoint)
+  VpcId:
+    Type: String
+    Default: ''
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+  CanarySecurityGroupId:
+    Type: String
+    Default: ''
+
+Conditions:
+  CreateSample: !Equals [ !Ref DeploySampleApp, 'yes' ]
+
+Resources:
+
+  SampleAppStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: CreateSample
+    Properties:
+      # `aws cloudformation package` rewrites this to the uploaded S3 URL.
+      TemplateURL: ../../sample-app/sample-app.yaml
+      Parameters:
+        # Every resource is prefixed with the stack name the user chose, so a
+        # deploy of '--stack-name deep-health' names everything 'deep-health-*'.
+        NamePrefix: !Ref AWS::StackName
+        # Clean, collision-safe table name derived from the root stack name,
+        # e.g. 'deep-health-health' — no auto-generated random suffix.
+        TableName: !Sub '${AWS::StackName}-health'
+
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./deep-health-uptime.yaml
+      Parameters:
+        # Drive all monitoring resource names from the stack name the user chose.
+        CanaryName: !Ref AWS::StackName
+        # Auto-wire: when the sample app is deployed, use its output; otherwise
+        # use the user-supplied TargetUrl.
+        TargetUrl: !If
+          - CreateSample
+          - !GetAtt SampleAppStack.Outputs.HealthDeepUrl
+          - !Ref TargetUrl
+        ScheduleExpression: !Ref ScheduleExpression
+        SloMs: !Ref SloMs
+        AlarmEmail: !Ref AlarmEmail
+        VpcSubnetIds: !Join [ ',', !Ref VpcSubnetIds ]
+        CanarySecurityGroupId: !Ref CanarySecurityGroupId
+        VpcId: !Ref VpcId
+
+Outputs:
+  MonitoredUrl:
+    Description: The /health/deep URL that is being monitored.
+    Value: !If [ CreateSample, !GetAtt SampleAppStack.Outputs.HealthDeepUrl, !Ref TargetUrl ]
+  SampleAppDeployed:
+    Value: !If [ CreateSample, 'yes', 'no' ]
+  DashboardName:
+    Value: !GetAtt MonitoringStack.Outputs.DashboardName
+  AlarmTopicArn:
+    Value: !GetAtt MonitoringStack.Outputs.AlarmTopicArn
+  WebACLArn:
+    Value: !GetAtt MonitoringStack.Outputs.WebACLArn
