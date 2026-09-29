@@ -8,12 +8,12 @@
     "node": ">=18"
   },
   "dependencies": {
-    "express": "4.19.2",
-    "pg": "8.11.5",
-    "redis": "4.6.13",
-    "mongodb": "6.5.0",
-    "@aws-sdk/client-dynamodb": "3.540.0",
-    "@aws-sdk/client-s3": "3.540.0"
+    "express": "4.22.3",
+    "pg": "8.23.0",
+    "redis": "4.7.1",
+    "mongodb": "6.21.0",
+    "@aws-sdk/client-dynamodb": "3.1142.0",
+    "@aws-sdk/client-s3": "3.1142.0"
   },
   "comment": "This manifest lists dependencies across ALL Node reference handlers. A given handler only needs a subset: express + (pg | redis | mongodb | @aws-sdk/client-dynamodb | @aws-sdk/client-s3). external-api and opensearch use only Node built-ins (https) + express."
 }
