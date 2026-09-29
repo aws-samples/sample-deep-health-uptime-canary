@@ -1,11 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  deep-health-uptime-canary — End-to-end uptime monitoring stack.
-  Provisions a CloudWatch Synthetics canary that probes a /health/deep endpoint,
-  plus availability/latency alarms, an SNS topic, a CloudWatch dashboard, an S3
-  artifact bucket, a least-privilege IAM role, and a WAF rate-based rule for the
-  health path. Supports non-VPC (default, public endpoint) and VPC (private
-  endpoint) deployment modes.
+  deep-health-uptime-canary — Measures end-to-end uptime by probing a deep-health
+  endpoint with a CloudWatch Synthetics canary, and reports it as an SLA percentage
+  with alarms.
 
 Parameters:
   TargetUrl:
@@ -330,7 +327,7 @@ Resources:
             {
               "type": "text", "x": 0, "y": 12, "width": 24, "height": 3,
               "properties": {
-                "markdown": "**Latency breakdown (diagnostic)** — from the target app's EMF metrics (`DeepHealth/Breakdown`): WHY latency is high, cold start vs. dependency query. The uptime SLO is still judged end-to-end (above). `ColdStartMs` is **Lambda-only** and stays empty on EC2/ECS/Fargate (long-lived processes, no per-request cold start) — there, read `TotalMs` (app total) and `DbQueryMs` (dependency query)."
+                "markdown": "**Latency breakdown (diagnostic)** — from the target app's EMF metrics (`DeepHealth/Breakdown`): WHY latency is high — total in-handler time vs. dependency-query round-trip. The uptime SLO is still judged end-to-end (above). For **cold-start** time, use the Logs Insights query in the tile to the right — it reads Lambda's real `@initDuration`. `TotalMs`/`DbQueryMs` populate on any compute; on EC2/ECS/Fargate there is no per-request cold start."
               }
             },
             {
@@ -339,24 +336,19 @@ Resources:
                 "title": "Latency breakdown over time (ms)",
                 "metrics": [
                   [ "DeepHealth/Breakdown", "TotalMs", "Service", "deep-health-sample", { "stat": "Average", "label": "Total (in-handler) ms" } ],
-                  [ "DeepHealth/Breakdown", "DbQueryMs", "Service", "deep-health-sample", { "stat": "Average", "label": "DB query ms" } ],
-                  [ "DeepHealth/Breakdown", "ColdStartMs", "Service", "deep-health-sample", { "stat": "Average", "label": "Cold start ms (cold invokes only)" } ]
+                  [ "DeepHealth/Breakdown", "DbQueryMs", "Service", "deep-health-sample", { "stat": "Average", "label": "DB query ms" } ]
                 ],
                 "view": "timeSeries", "period": 300, "region": "${AWS::Region}"
               }
             },
             {
-              "type": "metric", "x": 12, "y": 13, "width": 6, "height": 6,
+              "type": "text", "x": 18, "y": 13, "width": 6, "height": 6,
               "properties": {
-                "title": "Cold start (ms, latest)",
-                "metrics": [
-                  [ "DeepHealth/Breakdown", "ColdStartMs", "Service", "deep-health-sample", { "stat": "Maximum" } ]
-                ],
-                "view": "singleValue", "period": 300, "region": "${AWS::Region}"
+                "markdown": "**Cold start (real number)**\n\nLambda's own `@initDuration` is the authoritative cold-start time. In **CloudWatch \u2192 Logs Insights**, select your app's log group and run:\n\n```\nfilter @type=\"REPORT\" | filter ispresent(@initDuration)\n| stats avg(@initDuration) as avgMs, max(@initDuration) as maxMs, count() as coldStarts by bin(1h)\n```"
               }
             },
             {
-              "type": "metric", "x": 18, "y": 13, "width": 6, "height": 6,
+              "type": "metric", "x": 12, "y": 13, "width": 6, "height": 6,
               "properties": {
                 "title": "DB query (ms, avg)",
                 "metrics": [

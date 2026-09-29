@@ -36,7 +36,6 @@ latency, no SDK dependency):
 
 | Metric | Meaning |
 |---|---|
-| `ColdStartMs` | Lambda init / cold-start overhead — emitted **only on the cold invoke** |
 | `DbQueryMs` | the dependency probe round-trip (the handler already measures this) |
 | `TotalMs` | total in-handler time |
 
@@ -52,33 +51,30 @@ examples in [`node/dynamodb/health.js`](node/dynamodb/health.js) and
 
 ```js
 // Node
-const { emitBreakdown, coldStartMs } = require('../emf');
+const { emitBreakdown } = require('../emf');
 const q0 = Date.now();
 await probe();                       // your dependency probe
 const dbQueryMs = Date.now() - q0, totalMs = Date.now() - t0;
-emitBreakdown({ dbQueryMs, totalMs, coldMs: coldStartMs() });
+emitBreakdown({ dbQueryMs, totalMs });
 ```
 ```python
 # Python
-from emf import emit_breakdown, cold_start_ms
+from emf import emit_breakdown
 q0 = time.monotonic()
 probe()                              # your dependency probe
 db_query_ms = int((time.monotonic() - q0) * 1000)
 total_ms = int((time.monotonic() - t0) * 1000)
-emit_breakdown(db_query_ms, total_ms, cold_ms=cold_start_ms())
+emit_breakdown(db_query_ms, total_ms)
 ```
 
-The other reference handlers keep the same contract; add these three lines to any
-of them the same way. **`ColdStartMs` is Lambda-only.** EC2, ECS, and Fargate run
-long-lived processes with **no per-request cold start** — once a task is up it serves
-every request already-warm, and any one-time warm-up at task launch happens before the
-load balancer routes traffic, so users never wait through it. On those platforms
-`coldStartMs()` fires at most once per task launch (usually before real traffic) and is
-0 thereafter, so **`ColdStartMs` shows no data — which is the correct, honest signal,
-not a bug.** `DbQueryMs` and `TotalMs` still populate, giving you the meaningful
-**app-vs-database** split (for the ECS + Aurora hero architecture, `DbQueryMs` — the
-Aurora `SELECT 1` round-trip — is the metric that matters). On ECS/EKS, route stdout to
-CloudWatch Logs via awslogs/Fluent Bit so the EMF lines are picked up.
+The other reference handlers keep the same contract; add these two lines to any
+of them the same way. `DbQueryMs` and `TotalMs` populate on any compute (Lambda,
+EC2, ECS, Fargate), giving you the meaningful **app-vs-dependency** split (for the
+ECS + Aurora hero architecture, `DbQueryMs` — the Aurora `SELECT 1` round-trip — is
+the metric that matters). For **cold-start** time, read Lambda's `@initDuration` from
+the REPORT line via CloudWatch Logs Insights (see DEPLOYMENT.md) — the authoritative
+number, no app code required. On ECS/EKS, route stdout to CloudWatch Logs via
+awslogs/Fluent Bit so the EMF lines are picked up.
 
 ## Included references
 

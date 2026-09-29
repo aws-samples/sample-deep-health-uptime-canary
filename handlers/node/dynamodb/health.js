@@ -10,8 +10,8 @@
  */
 const express = require('express');
 const { DynamoDBClient, DescribeTableCommand } = require('@aws-sdk/client-dynamodb');
-// Optional latency-breakdown metrics (cold start / query / total). See ../emf.js.
-const { emitBreakdown, coldStartMs } = require('../emf');
+// Optional latency-breakdown metrics (query / total; cold start via @initDuration). See ../emf.js.
+const { emitBreakdown } = require('../emf');
 
 const app = express();
 
@@ -29,7 +29,7 @@ app.get('/health/deep', async (req, res) => {
     await ddb.send(new DescribeTableCommand({ TableName: process.env.HEALTH_TABLE }));
     const dbQueryMs = Date.now() - q0;
     const totalMs = Date.now() - t0;
-    emitBreakdown({ dbQueryMs, totalMs, coldMs: coldStartMs() });   // diagnostic only
+    emitBreakdown({ dbQueryMs, totalMs });   // diagnostic only
     res.status(200).json({ status: 'ok', db: 'ok', latencyMs: totalMs, dbQueryMs });
   } catch (err) {
     const kind = /timeout/i.test(String(err)) ? 'timeout' : 'error';

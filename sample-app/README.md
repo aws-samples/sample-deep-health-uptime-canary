@@ -1,4 +1,4 @@
-# Sample target app (this is optional)
+# Sample target app (optional)
 
 A fully serverless, **pay-per-request** application you can deploy to try the
 deep-health uptime monitoring solution end to end — no bring-your-own-app

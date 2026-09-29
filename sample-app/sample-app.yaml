@@ -1,16 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  deep-health-uptime-canary — OPTIONAL sample target application.
-  A fully serverless, pay-per-request app you can deploy to try the monitoring
-  solution end to end: an API Gateway HTTP API → Lambda → DynamoDB (on-demand),
-  exposing a /health/deep endpoint that does a real dependency round trip.
-
-  Cost: ~$0 at rest. Lambda + API Gateway + DynamoDB on-demand are all
-  pay-per-request with no idle/hourly charge, so it is safe to leave running.
-  (The monitoring canary you point at it is the only ongoing cost — see the
-  main solution.) This sample demonstrates the Lambda + DynamoDB path; the
-  reference "hero" architecture is ECS + Aurora, but the /health/deep contract
-  and the canary are identical.
+  deep-health-uptime-canary — OPTIONAL serverless sample app (API Gateway → Lambda →
+  DynamoDB on-demand, ≈ $0 at rest) exposing a /health/deep endpoint to try the
+  monitoring solution end to end.
 
 Parameters:
   NamePrefix:
@@ -130,20 +122,15 @@ Resources:
           // Latency breakdown: this handler emits three CloudWatch metrics via EMF
           // (Embedded Metric Format — just a structured log line, no extra API call,
           // no added request latency):
-          //   ColdStartMs — Lambda init/cold-start overhead (emitted only on the cold invoke)
           //   DbQueryMs   — the dependency (DynamoDB GetItem) round-trip time
           //   TotalMs     — total in-handler time
           // These are DIAGNOSTIC only; the uptime SLO is still judged end-to-end by the
           // canary. They let you see WHY latency is high (cold start vs. slow query).
-          // Container-init timestamp. On a COLD container the module is loaded fresh, so
-          // this is set at init; the gap between it and the first invocation captures the
-          // cold-container warm-up the user actually waits through. (Lambda's own
-          // `@initDuration` in the REPORT log line is the authoritative init number — see
-          // the Logs Insights query in DEPLOYMENT.md; this metric is the in-handler proxy.)
-          const INIT_START = Date.now();           // set once at container init (cold only)
+          // Cold-start time is read from Lambda's own `@initDuration` (REPORT log line)
+          // via CloudWatch Logs Insights — see DEPLOYMENT.md. We do NOT synthesize a
+          // cold-start metric in-handler (that would include idle wait, not just init).
           const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
           const ddb = new DynamoDBClient({ maxAttempts: 1 });
-          let isCold = true;                       // true only on the first invoke of a fresh container
           // Emit a metric via EMF. metrics = [{name, value, unit}]; dims picked up from properties.
           // NOTE: this sample hardcodes the Service dimension to 'deep-health-sample', which is
           // exactly what the dashboard's latency-breakdown widgets query. Your OWN app, using the
@@ -168,11 +155,6 @@ Resources:
               return { statusCode: 200, headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({ app: 'sample', message: 'ok — try /health/deep' }) };
             }
-            const coldThisInvoke = isCold;
-            isCold = false;                         // subsequent invokes on this container are warm
-            // On the cold invoke, the container warm-up the user waited through is the gap
-            // from container init to now. 0 on warm invokes.
-            const coldStartMs = coldThisInvoke ? (t0 - INIT_START) : 0;
             try {
               const q0 = Date.now();
               const out = await ddb.send(new GetItemCommand({ TableName: process.env.HEALTH_TABLE,
@@ -180,13 +162,11 @@ Resources:
               const dbQueryMs = Date.now() - q0;
               if (!out.Item) throw new Error('sentinel item missing');
               const totalMs = Date.now() - t0;
-              // Diagnostic breakdown metrics. ColdStartMs only on the cold invoke.
+              // Diagnostic breakdown metrics (cold start comes from Lambda @initDuration, not here).
               const metrics = [ { name: 'DbQueryMs', value: dbQueryMs }, { name: 'TotalMs', value: totalMs } ];
-              if (coldThisInvoke) metrics.push({ name: 'ColdStartMs', value: coldStartMs });
-              emit(metrics, { coldStart: coldThisInvoke });
+              emit(metrics);
               return { statusCode: 200, headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ status: 'ok', db: 'ok', latencyMs: totalMs,
-                  dbQueryMs, coldStart: coldThisInvoke, coldStartMs }) };
+                body: JSON.stringify({ status: 'ok', db: 'ok', latencyMs: totalMs, dbQueryMs }) };
             } catch (e) {
               const kind = /timeout/i.test(String(e)) ? 'timeout' : 'error';
               return { statusCode: 503, headers: { 'content-type': 'application/json' },

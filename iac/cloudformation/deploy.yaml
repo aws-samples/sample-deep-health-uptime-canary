@@ -1,21 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  deep-health-uptime-canary — one-shot root stack. Optionally deploys the sample
-  target app and wires its /health/deep URL straight into the monitoring stack,
-  so you don't have to copy any values between stacks. Set DeploySampleApp=yes to
-  deploy the sample app + monitoring together; set DeploySampleApp=no and provide
-  TargetUrl to monitor your own existing endpoint.
-
-  NESTED STACKS require the child templates in S3. Package once, then deploy:
-    aws cloudformation package \
-      --template-file iac/cloudformation/deploy.yaml \
-      --s3-bucket <YOUR_ARTIFACT_BUCKET> \
-      --output-template-file packaged.yaml
-    aws cloudformation deploy \
-      --template-file packaged.yaml \
-      --stack-name deep-health-uptime \
-      --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
-      --parameter-overrides DeploySampleApp=yes AlarmEmail=you@example.com
+  deep-health-uptime-canary — one-shot root stack. Deploys the CloudWatch Synthetics
+  uptime monitor, optionally with the serverless sample app (DeploySampleApp=yes) or
+  against your own endpoint (DeploySampleApp=no + TargetUrl).
 
 Parameters:
   DeploySampleApp:

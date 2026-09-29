@@ -12,8 +12,8 @@ import time
 import boto3
 from botocore.config import Config
 from fastapi import FastAPI, Response
-# Optional latency-breakdown metrics (cold start / query / total). See ../emf.py.
-from emf import emit_breakdown, cold_start_ms
+# Optional latency-breakdown metrics (query / total; cold start via @initDuration). See ../emf.py.
+from emf import emit_breakdown
 
 app = FastAPI()
 
@@ -34,7 +34,7 @@ async def health_deep(response: Response):
         _ddb.describe_table(TableName=HEALTH_TABLE)
         db_query_ms = int((time.monotonic() - q0) * 1000)
         total_ms = int((time.monotonic() - t0) * 1000)
-        emit_breakdown(db_query_ms, total_ms, cold_ms=cold_start_ms())  # diagnostic only
+        emit_breakdown(db_query_ms, total_ms)  # diagnostic only
         return {"status": "ok", "db": "ok", "latencyMs": total_ms, "dbQueryMs": db_query_ms}
     except Exception as e:  # noqa: BLE001
         kind = "timeout" if "timeout" in str(e).lower() else "error"

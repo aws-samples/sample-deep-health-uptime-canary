@@ -161,7 +161,6 @@ export class DeepHealthUptimeStack extends cdk.Stack {
     });
     const totalMs = bd('TotalMs', 'Average', 'Total (in-handler) ms');
     const dbQueryMs = bd('DbQueryMs', 'Average', 'DB query ms');
-    const coldStartMs = bd('ColdStartMs', 'Average', 'Cold start ms (cold invokes only)');
 
     const dashboard = new cloudwatch.Dashboard(this, 'UptimeDashboard', { dashboardName: `${canaryName}-uptime` });
     dashboard.addWidgets(
@@ -169,10 +168,10 @@ export class DeepHealthUptimeStack extends cdk.Stack {
       new cloudwatch.GraphWidget({ title: 'End-to-end latency (Duration ms)', left: [duration], width: 12 }),
       new cloudwatch.SingleValueWidget({ title: 'Cumulative uptime %', metrics: [uptime], width: 12, setPeriodToTimeRange: true }),
       new cloudwatch.GraphWidget({ title: 'Passed vs Failed runs', left: [passed, failed], width: 12 }),
-      new cloudwatch.TextWidget({ markdown: '**Latency breakdown (diagnostic)** — from the target app\'s EMF metrics (`DeepHealth/Breakdown`): WHY latency is high, cold start vs. dependency query. The uptime SLO is still judged end-to-end (above). `ColdStartMs` is **Lambda-only** and stays empty on EC2/ECS/Fargate (long-lived processes, no per-request cold start) — there, read `TotalMs` (app total) and `DbQueryMs` (dependency query).', width: 24, height: 3 }),
-      new cloudwatch.GraphWidget({ title: 'Latency breakdown over time (ms)', left: [totalMs, dbQueryMs, coldStartMs], width: 12 }),
-      new cloudwatch.SingleValueWidget({ title: 'Cold start (ms, latest)', metrics: [coldStartMs.with({ statistic: 'Maximum' })], width: 6 }),
+      new cloudwatch.TextWidget({ markdown: '**Latency breakdown (diagnostic)** — from the target app\'s EMF metrics (`DeepHealth/Breakdown`): WHY latency is high — total in-handler time vs. dependency-query round-trip. The uptime SLO is still judged end-to-end (above). For **cold-start** time, use the Logs Insights query in the next tile — it reads Lambda\'s real `@initDuration`. `TotalMs`/`DbQueryMs` populate on any compute.', width: 24, height: 3 }),
+      new cloudwatch.GraphWidget({ title: 'Latency breakdown over time (ms)', left: [totalMs, dbQueryMs], width: 12 }),
       new cloudwatch.SingleValueWidget({ title: 'DB query (ms, avg)', metrics: [dbQueryMs], width: 6 }),
+      new cloudwatch.TextWidget({ markdown: "**Cold start (real number)**\n\nLambda's own `@initDuration` is the authoritative cold-start time. In **CloudWatch \u2192 Logs Insights**, select your app's log group and run:\n\n```\nfilter @type=\"REPORT\" | filter ispresent(@initDuration)\n| stats avg(@initDuration) as avgMs, max(@initDuration) as maxMs, count() as coldStarts by bin(1h)\n```", width: 6, height: 6 }),
     );
 
     // ---- WAF rate rule scoped to /health/deep ----

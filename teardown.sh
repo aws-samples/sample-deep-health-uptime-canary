@@ -58,6 +58,23 @@ if [[ -z "${REGION}" ]]; then
   [[ -n "${REGION}" ]] || die "No region set. Pass --region or configure the AWS CLI."
 fi
 
+# Verify the stack actually exists BEFORE doing anything. delete-stack is idempotent
+# and returns success for a non-existent stack, so without this check a wrong/missing
+# --stack-name would print a false "deleted" and leave the real stack (and its canary
+# cost) running. Fail fast with a helpful message instead.
+if ! aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "Error: stack '${STACK_NAME}' not found in ${REGION}." >&2
+  echo "Pass the SAME --stack-name you deployed with (default is 'deep-health-uptime')." >&2
+  matches="$(aws cloudformation list-stacks --region "${REGION}" \
+    --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE IMPORT_COMPLETE \
+    --query "StackSummaries[?contains(StackName, 'health') || contains(StackName, 'dhealth')].StackName" \
+    --output text 2>/dev/null || true)"
+  if [[ -n "${matches}" && "${matches}" != "None" ]]; then
+    echo "Candidate stacks in ${REGION}: ${matches}" >&2
+  fi
+  exit 1
+fi
+
 # Stop all Synthetics canaries in this stack (and nested stacks) BEFORE emptying the
 # artifact bucket. The canary runs on a schedule (as often as every minute) and writes
 # a fresh artifact each run — if it keeps running during teardown it re-fills the bucket
