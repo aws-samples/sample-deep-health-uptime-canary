@@ -17,7 +17,7 @@
 #   --stack-name <name>         CloudFormation stack name (default: deep-health-uptime).
 #   --bucket <name>             S3 bucket for packaged templates (default: auto-created per account/region).
 #   --schedule <expr>           Canary schedule (default: "rate(5 minutes)").
-#   --slo-ms <n>                End-to-end latency SLO in ms, incl. cold start (default: 3000).
+#   --slo-ms <n>                End-to-end latency SLO in ms, incl. cold start (default: 2000).
 #   --alarm-period <seconds>    Alarm evaluation period: 60|300|900|3600. Derived from --schedule
 #                               automatically; pass this only to override the derived value.
 #   --alarm-email <email>       Email subscribed to the alarm SNS topic (optional).
@@ -38,7 +38,7 @@ DEPLOY_SAMPLE="no"
 TARGET_URL=""
 BUCKET=""
 SCHEDULE="rate(5 minutes)"
-SLO_MS="3000"
+SLO_MS="2000"
 ALARM_PERIOD="300"
 ALARM_EMAIL=""
 VPC_ID=""

@@ -9,12 +9,12 @@ it into the canary. Point it at your handler's URL and it checks:
   2. The JSON is well-formed and carries the required keys.
   3. A degraded/unreachable dependency yields HTTP 503 with status "degraded"
      (run with --expect-degraded to assert the failure path).
-  4. The endpoint responds within the SLO budget (--slo-ms, default 3000),
+  4. The endpoint responds within the SLO budget (--slo-ms, default 2000),
      i.e. it fails fast rather than hanging.
 
 Usage:
   python contract_test.py --url https://app.example.com/health/deep
-  python contract_test.py --url http://localhost:8080/health/deep --slo-ms 3000
+  python contract_test.py --url http://localhost:8080/health/deep --slo-ms 2000
   python contract_test.py --url .../health/deep --expect-degraded   # failure-path
 
 Exit code 0 = contract satisfied, non-zero = violation (CI-friendly).
@@ -53,7 +53,7 @@ def check(name, ok, detail=""):
 def main() -> int:
     ap = argparse.ArgumentParser(description="Validate a /health/deep handler against the contract.")
     ap.add_argument("--url", required=True, help="Full URL of the /health/deep endpoint.")
-    ap.add_argument("--slo-ms", type=int, default=3000, help="Latency budget in ms (default 3000, matching the solution default).")
+    ap.add_argument("--slo-ms", type=int, default=2000, help="Latency budget in ms (default 2000, matching the solution default).")
     ap.add_argument("--expect-degraded", action="store_true",
                     help="Assert the failure path: expect HTTP 503 + status 'degraded'.")
     ap.add_argument("--timeout", type=float, default=10.0, help="Request timeout in seconds.")

@@ -71,7 +71,7 @@ bash deploy.sh --target-url https://your-app/health/deep --stack-name deep-healt
 
 It prints every stack output when done — including the dashboard name, monitored URL, and SNS topic.
 
-**Verify it works.** Open the CloudWatch dashboard named **`<stack-name>-uptime`** ([shown above](#the-dashboard)). After a few runs, **Availability % (SuccessPercent)** sits at 100% and the **Cumulative uptime %** widget populates. In **CloudWatch → Application Signals → Synthetics Canaries**, open any run to see its step result and the HTTP request report — including the DNS/TCP/TLS/first-byte timing breakdown that tells you *where* a slow response was spent.
+**Verify it works.** Open the CloudWatch dashboard named **`<stack-name>-uptime`** ([shown below](#the-dashboard)). After a few runs, **Availability % (SuccessPercent)** sits at 100% and the **Cumulative uptime %** widget populates. In **CloudWatch → Application Signals → Synthetics Canaries**, open any run to see its step result and the HTTP request report — including the DNS/TCP/TLS/first-byte timing breakdown that tells you *where* a slow response was spent.
 
 **Prove a failure is caught.** With the sample app deployed, induce a real dependency failure and watch the canary flip to failing (and the alarm fire), then recover:
 
@@ -95,7 +95,7 @@ If you deployed under another stack name, pass `--sample-stack <your-stack-name>
 > dependency your health endpoint probes (revoke the reader's permission, point it at an
 > unreachable host) and watch the canary report 503.
 
-> **One knob to know:** `SloMs` (default **3000 ms**) is the full response time a user experiences, **including any backend cold start** — cold-start slowness correctly counts against uptime rather than being hidden. Tighten it for a warm, steady-traffic service.
+> **One knob to know:** `SloMs` (default **2000 ms**) is the full response time a user experiences, **including any backend cold start** — cold-start slowness correctly counts against uptime rather than being hidden. A breach is recorded as a **failed run**, not just a latency alarm, so the value has to be honest. The default is sized against the bundled sample app, measured over 4,800+ runs: **p50 ≈ 140 ms, p90 ≈ 175 ms, cold starts ≈ 1.45 s**. **Raise it for a slower backend** — a JVM or .NET target cold-starts past 2 s — and tighten it only once you've confirmed your own p99.
 
 **→ Full deployment guide: [`DEPLOYMENT.md`](DEPLOYMENT.md)** — prerequisites, the deep-health endpoint contract, all deploy methods (guided / one-shot root stack / CloudFormation), the parameters reference, VPC vs non-VPC (with the egress precheck), retargeting, and teardown.
 
@@ -111,22 +111,23 @@ The infrastructure-as-code provisions the **monitoring stack only** — it does 
 6. **Amazon SNS topic** — breach notifications.
 7. **Amazon CloudWatch dashboard** (`<stack-name>-uptime`) — four widgets: **Availability % (SuccessPercent)** over time, **End-to-end latency** with the SLO drawn as a threshold line, **Cumulative uptime %** for the selected range, and **Total vs Failed runs**.
 
-**Cost:** roughly **$10.50/month per monitored endpoint** at a 5-minute cadence (about $52/month at 1-minute) — almost all of it the canary runs themselves, at $0.0012 each. Alarms and the dashboard are free within the account-wide free tiers ($3.20/month beyond them), and the canary's metrics are included in the run price rather than billed as custom metrics. VPC mode adds a NAT Gateway (~$33/month) unless you use VPC endpoints. See the verified breakdown in [DEPLOYMENT.md → Cost](DEPLOYMENT.md#cost).
+**Cost:** roughly **$10.50/month per monitored endpoint** at a 5-minute cadence (about $52.60/month at 1-minute) — almost all of it the canary runs themselves, at $0.0012 each. Alarms and the dashboard are free within the account-wide free tiers ($3.20/month beyond them), and the canary's metrics are included in the run price rather than billed as custom metrics. VPC mode adds a NAT Gateway (~$33/month) unless you use VPC endpoints. See the verified breakdown in [DEPLOYMENT.md → Cost](DEPLOYMENT.md#cost).
 
 ## The dashboard
 
-![CloudWatch dashboard with four widgets. Availability % holds at 100% then drops to 0% for about twenty minutes before recovering. End-to-end latency runs near 100 ms with a 1.4-second cold-start spike. Cumulative uptime % reads 86.6%. Total vs Failed runs reads 142 total and 19 failed.](images/dashboard.png)
+![CloudWatch dashboard with four widgets. Availability % holds at 100% and drops to 0% twice, for about twenty minutes each, recovering both times. End-to-end latency runs near 130 ms against a red SLO threshold line at 2000 ms, with cold-start spikes reaching about 1.2 seconds. Cumulative uptime % reads 87.9%. Total vs Failed runs reads 314 total and 38 failed.](images/dashboard.png)
 
-The four widgets above, captured during a real induced outage (`test/break-dependency.sh`, then
-`test/restore-dependency.sh`). The dip is the sample app's DynamoDB dependency being broken and
-restored — the canary caught every failed run, and the availability alarm fired on the first one.
+The four widgets above, captured over six hours spanning two real induced outages
+(`test/break-dependency.sh`, then `test/restore-dependency.sh`). Each dip is the sample app's
+DynamoDB dependency being broken and restored — the canary caught every failed run, and the
+availability alarm fired on the first failed run of each dip.
 
 Two things worth reading off this screenshot:
 
-- **The bottom two widgets agree exactly.** 19 of 142 runs failed, and cumulative uptime reads
-  **86.6%** — which is `(142 − 19) / 142`. Those are two different statistics on the same metric
+- **The bottom two widgets agree exactly.** 38 of 314 runs failed, and cumulative uptime reads
+  **87.9%** — which is `(314 − 38) / 314`. Those are two different statistics on the same metric
   arriving at the same answer, which is the whole basis of the calculation in the next section.
-- **The 1.4-second spike is a real cold start**, not monitoring overhead. The latency widget plots
+- **The spikes to ~1.2 s are real cold starts**, not monitoring overhead. The latency widget plots
   the **per-step** `Duration`, so it measures the HTTP round trip a user would have waited for —
   canary runtime boot time is excluded.
 

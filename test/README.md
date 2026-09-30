@@ -7,7 +7,7 @@ contract before you wire it into the canary. Standard library only — no instal
 
 ```bash
 # Happy path — expect 200 {status:ok, latencyMs} within the SLO
-python3 contract_test.py --url https://app.example.com/health/deep --slo-ms 3000
+python3 contract_test.py --url https://app.example.com/health/deep --slo-ms 2000
 
 # Failure path — expect 503 {status:degraded} (point at a handler with a paused dependency)
 python3 contract_test.py --url https://app.example.com/health/deep --expect-degraded

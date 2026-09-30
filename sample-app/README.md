@@ -57,7 +57,7 @@ URL=$(aws cloudformation describe-stacks --stack-name deep-health-sample \
 curl -s "$URL"      # → {"status":"ok","db":"ok","latencyMs":<n>}
 
 # Validate against the contract test shipped in this repo:
-python3 test/contract_test.py --url "$URL" --slo-ms 3000
+python3 test/contract_test.py --url "$URL" --slo-ms 2000
 ```
 
 Then deploy the monitoring stack pointed at `$URL` — see the repo

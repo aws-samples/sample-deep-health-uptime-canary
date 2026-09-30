@@ -47,16 +47,20 @@ Parameters:
     Description: Canary schedule. Between rate(1 minute) and rate(1 hour).
   SloMs:
     Type: Number
-    Default: 3000
+    Default: 2000
     MinValue: 1
     MaxValue: 10000
     Description: >-
       End-to-end latency SLO in milliseconds. The canary fails a run if the FULL response
       time (as a user experiences it, INCLUDING any backend cold start) exceeds this. Set
-      it to the real budget you promise users — do not shrink it to hide cold starts. A
-      serverless target that can cold-start needs an honest budget (e.g. 3000ms); a
-      warm, steady-traffic service can use a tighter one. Capped at 10000ms so the assertion
-      always evaluates within the canary run timeout (which also covers runtime boot).
+      it to the real budget you promise users — do not shrink it to hide cold starts. The
+      2000ms default is sized against the bundled sample app (API Gateway + Node Lambda +
+      DynamoDB), measured over 4,800+ runs at p50 ~140ms, p90 ~175ms, and cold starts
+      peaking at ~1.45s — so it leaves roughly 1.4x headroom over a cold start. RAISE it
+      for a slower backend: a JVM or .NET target cold-starts well past 2000ms, and a breach
+      is recorded as a FAILED RUN (not just a latency alarm), so too tight a value turns
+      cold starts into false outages. Capped at 10000ms so the assertion always evaluates
+      within the canary run timeout (which also covers runtime boot).
   AlarmPeriodSeconds:
     Type: Number
     Default: 300
@@ -220,7 +224,7 @@ Resources:
           // full commentary. `python3 test/repo_checks.py` fails if the two drift.
           const deepHealthCheck = async function () {
             const url = process.env.TARGET_URL;
-            const sloMs = parseInt(process.env.SLO_MS || '3000', 10);
+            const sloMs = parseInt(process.env.SLO_MS || '2000', 10);
             if (!url) throw new Error('TARGET_URL environment variable is required');
 
             const u = new URL(url);

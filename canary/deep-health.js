@@ -32,8 +32,10 @@
  * compatible with runtimes older than 13.1 (legacy `Synthetics`/`SyntheticsLogger`
  * namespace) nor with the Playwright runtimes (different API).
  *
- * Env vars: TARGET_URL (required), SLO_MS (default 3000 — an honest end-to-end
- * budget that accounts for cold starts; tighten for warm, steady-traffic services).
+ * Env vars: TARGET_URL (required), SLO_MS (default 2000 — sized against the bundled
+ * sample app, measured at p50 ~140ms / p90 ~175ms / cold starts ~1.45s, so ~1.4x
+ * headroom. RAISE it for a slower backend: exceeding it fails the RUN, not just the
+ * latency alarm, so too tight a value records cold starts as false outages).
  *
  * This is the standalone reference script and the SOURCE OF TRUTH for the canary
  * logic. The CloudFormation template (iac/cloudformation/deep-health-uptime.yaml)
@@ -46,7 +48,7 @@ const log = require('@aws/synthetics-logger');
 
 const deepHealthCheck = async function () {
   const url = process.env.TARGET_URL;
-  const sloMs = parseInt(process.env.SLO_MS || '3000', 10);
+  const sloMs = parseInt(process.env.SLO_MS || '2000', 10);
   if (!url) throw new Error('TARGET_URL environment variable is required');
 
   // executeHttpStep accepts a URL string or an http.request-style options

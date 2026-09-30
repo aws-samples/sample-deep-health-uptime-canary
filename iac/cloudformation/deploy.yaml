@@ -37,7 +37,7 @@ Parameters:
       set AlarmPeriodSeconds to match (see its description) — otherwise the alarms flap.
   SloMs:
     Type: Number
-    Default: 3000
+    Default: 2000
     MinValue: 1
     MaxValue: 10000
     Description: >-

@@ -11,7 +11,9 @@ End-to-end steps to stand up the deep-health uptime monitoring stack.
 
 > **Canary runtime:** the stack pins `syn-nodejs-puppeteer-17.0` (Node.js 22.x) and the script uses the current `@aws/synthetics-*` namespace (`@aws/synthetics-puppeteer`, `@aws/synthetics-logger`), introduced in `syn-nodejs-puppeteer-13.1`. It is **not** compatible with runtimes older than 13.1 or with the Playwright runtimes — if you change the runtime, keep the script's `require(...)` namespace in sync.
 
-> **Latency SLO — set an honest end-to-end budget.** `SloMs` (default `3000`) is the full response time a user experiences, **including any backend cold start** (the canary waits for the complete response, so cold-start slowness correctly counts against uptime — it is not hidden). A warm, steady-traffic ECS + Aurora service can use a tighter budget. Don't shrink the SLO to mask cold starts — fix them with provisioned concurrency, not a smaller number.
+> **Latency SLO — set an honest end-to-end budget.** `SloMs` (default `2000`) is the full response time a user experiences, **including any backend cold start** (the canary waits for the complete response, so cold-start slowness correctly counts against uptime — it is not hidden). A breach is recorded as a **failed run** (`SuccessPercent` → 0), not merely a latency alarm, so an unrealistic value shows up as a false outage in the uptime number itself.
+>
+> The `2000` default is sized against the bundled sample app (API Gateway + Node Lambda + DynamoDB), measured across **4,832 runs on seven canaries**: p50 **140 ms**, p90 **175 ms**, and cold starts peaking at **1,456 ms** — about 1.4× headroom over a cold start. **Raise it if your backend is slower**: a JVM or .NET Lambda cold-starts well past 2 s, and at a `rate(5 minutes)` schedule you hit cold starts more often than at `rate(1 minute)` because the target sits at Lambda's idle-eviction boundary. Confirm your own p99 before tightening it. Don't shrink the SLO to mask cold starts — fix them with provisioned concurrency, not a smaller number.
 
 > **Note — this is a minimal reference sample.** To keep it near-$0 and easy to read, the stack ships without some production-hardening options a scanner will flag: no customer-managed KMS keys or point-in-time recovery on the sample DynamoDB table, no dead-letter queue or reserved concurrency on the sample Lambda, no server-side-encryption CMK on the SNS topic, and no access-logging/versioning on the artifact bucket. These are safe to omit for evaluating the pattern; **enable the ones your environment requires before using this in production.**
 
@@ -42,7 +44,7 @@ Deploy your app with the new endpoint.
 ## Step 2 — Validate the endpoint (before wiring the canary)
 
 ```bash
-python3 test/contract_test.py --url https://app.example.com/health/deep --slo-ms 3000
+python3 test/contract_test.py --url https://app.example.com/health/deep --slo-ms 2000
 
 # verify the failure path against a staging instance with a paused dependency:
 python3 test/contract_test.py --url https://staging.example.com/health/deep --expect-degraded
@@ -111,7 +113,7 @@ aws cloudformation deploy \
       TargetUrl=https://app.example.com/health/deep \
       ScheduleExpression="rate(5 minutes)" \
       AlarmPeriodSeconds=300 \
-      SloMs=3000 \
+      SloMs=2000 \
       AlarmEmail=you@example.com
 ```
 
@@ -130,7 +132,7 @@ aws cloudformation deploy \
       TargetUrl=https://internal-alb.internal/health/deep \
       ScheduleExpression="rate(5 minutes)" \
       AlarmPeriodSeconds=300 \
-      SloMs=3000 \
+      SloMs=2000 \
       AlarmEmail=you@example.com \
       VpcSubnetIds=subnet-0aaa,subnet-0bbb \
       CanarySecurityGroupId=sg-0abc123
@@ -264,7 +266,7 @@ filter @type = "REPORT"
 | `TargetUrl` | — | Full `/health/deep` URL (required) |
 | `CanaryName` | `deep-health` | ≤21 chars |
 | `ScheduleExpression` | `rate(5 minutes)` | `rate(1 minute)`–`rate(1 hour)`. **Keep `AlarmPeriodSeconds` in step with it** |
-| `SloMs` | `3000` | End-to-end latency budget (ms), incl. any cold start. Max `10000` (see below) |
+| `SloMs` | `2000` | End-to-end latency budget (ms), incl. any cold start. Max `10000` (see below) |
 | `AlarmPeriodSeconds` | `300` | Alarm evaluation period: `60`\|`300`\|`900`\|`3600`. Must be ≥ the probe interval. `deploy.sh` derives it from the schedule |
 | `AlarmEmail` | — | SNS email subscription |
 | `VpcSubnetIds` | — | Enables VPC mode when set (comma-separated; 2+ in different AZs recommended) |
@@ -316,7 +318,7 @@ The URL the canary probes is the `TargetUrl` stack parameter, set at deploy time
 
 **Common case: you deployed with the sample app and now want to monitor your own endpoint.**
 
-1. **Add a deep health endpoint to your application** if you haven't already — copy the reference handler closest to your stack from [`handlers/`](handlers/), adapt the probe, and deploy. Validate it: `python3 test/contract_test.py --url https://your-app/health/deep --slo-ms 3000`.
+1. **Add a deep health endpoint to your application** if you haven't already — copy the reference handler closest to your stack from [`handlers/`](handlers/), adapt the probe, and deploy. Validate it: `python3 test/contract_test.py --url https://your-app/health/deep --slo-ms 2000`.
 2. **Re-deploy the same stack, retargeted:**
    ```bash
    bash deploy.sh --stack-name deep-health-uptime --target-url https://your-app/health/deep
