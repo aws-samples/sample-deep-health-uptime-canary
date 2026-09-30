@@ -11,6 +11,7 @@
 - [Architecture](#architecture)
 - [Quick start](#quick-start)
 - [What the solution deploys](#what-the-solution-deploys)
+- [The dashboard](#the-dashboard)
 - [How uptime is calculated](#how-uptime-is-calculated)
 - [What app owners change](#what-app-owners-change)
 - [Repository layout](#repository-layout)
@@ -35,7 +36,7 @@ The canary is a managed AWS Lambda function that CloudWatch Synthetics runs **in
 - An **AWS account** with permissions for Amazon CloudWatch Synthetics, CloudWatch alarms/dashboards, Amazon SNS, Amazon S3, and AWS IAM.
 - The **AWS CLI** installed and configured for your target account and Region. The solution deploys to your configured default Region (from `AWS_REGION`/`AWS_DEFAULT_REGION` or `aws configure`) unless you pass `--region`.
 - **Git** and **Bash** (to clone the repo and run `deploy.sh`).
-- An application with an **HTTPS deep-health endpoint** — or use the bundled [`sample-app/`](sample-app/). For **VPC mode** only: private subnets with egress to CloudWatch and Amazon S3 (a NAT Gateway, or S3 + `monitoring`/`logs` VPC endpoints).
+- An application with a **deep-health endpoint** reachable over **HTTPS** (plain `http://` works too, but HTTPS is strongly recommended) — or use the bundled [`sample-app/`](sample-app/). For **VPC mode** only: private subnets with egress to CloudWatch and Amazon S3 (a NAT Gateway, or S3 + `monitoring`/`logs` VPC endpoints).
 
 Full details in [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
@@ -55,19 +56,22 @@ Your workload runs in a VPC in both modes; only the **canary's** placement chang
 
 Don't have an app handy? Deploy the optional [`sample-app/`](sample-app/) — a fully serverless, pay-per-request target (Amazon API Gateway → AWS Lambda → Amazon DynamoDB) that costs **≈ $0 at rest**. Otherwise, point the canary at your own endpoint (any path that returns the deep-health contract below — `/health/deep` is just the convention used throughout this repo).
 
-The guided `deploy.sh` packages the templates and deploys the stack in one step. Run it with **no flags** and it prompts for stack name, sample-app-or-your-URL, public-or-private, schedule, and alarm email:
+Clone the repo, then run the guided `deploy.sh` — it packages the nested templates to S3 and deploys the stack in one step. Run it with **no flags** and it prompts for stack name, sample-app-or-your-URL, public-or-private, schedule, and alarm email:
 
 ```bash
+git clone https://github.com/aws-samples/sample-deep-health-uptime-canary.git
+cd sample-deep-health-uptime-canary
+
 bash deploy.sh                 # guided (prompts for everything)
 
 # …or fully specified with flags:
-bash deploy.sh --sample-app --stack-name deep-health --schedule "rate(1 minute)" --alarm-email you@example.com
-bash deploy.sh --target-url https://your-app/health/deep --stack-name deep-health --alarm-email you@example.com
+bash deploy.sh --sample-app --stack-name deep-health-uptime --schedule "rate(1 minute)" --alarm-email you@example.com
+bash deploy.sh --target-url https://your-app/health/deep --stack-name deep-health-uptime --alarm-email you@example.com
 ```
 
-It prints the dashboard name, monitored URL, and SNS topic when done. Open the CloudWatch dashboard (named after your stack) and, after a few runs, `SuccessPercent` sits at 100% and the cumulative **uptime %** widget populates.
+It prints every stack output when done — including the dashboard name, monitored URL, and SNS topic.
 
-**Verify it works.** Open the **CloudWatch dashboard** (named after your stack) — after a few runs, `SuccessPercent` shows 100% and the cumulative **uptime %** widget populates. In **CloudWatch → Application Signals → Synthetics Canaries**, open any run to see its steps, screenshots, and HAR.
+**Verify it works.** Open the CloudWatch dashboard named **`<stack-name>-uptime`** ([shown above](#the-dashboard)). After a few runs, **Availability % (SuccessPercent)** sits at 100% and the **Cumulative uptime %** widget populates. In **CloudWatch → Application Signals → Synthetics Canaries**, open any run to see its step result and the HTTP request report — including the DNS/TCP/TLS/first-byte timing breakdown that tells you *where* a slow response was spent.
 
 **Prove a failure is caught.** With the sample app deployed, induce a real dependency failure and watch the canary flip to failing (and the alarm fire), then recover:
 
@@ -75,6 +79,21 @@ It prints the dashboard name, monitored URL, and SNS topic when done. Open the C
 bash test/break-dependency.sh      # deletes the sample app's health sentinel → 503
 bash test/restore-dependency.sh    # re-seeds it → back to healthy
 ```
+
+Run from a terminal they ask for the region and the DynamoDB table — press Enter at both
+prompts to auto-discover the table from the default stack name (`deep-health-uptime`), or
+name a different stack. Pass `--table` and `--region` to skip the prompts entirely (e.g.
+in CI): `bash test/break-dependency.sh --table deep-health-uptime-health --region us-east-1`.
+If you deployed under another stack name, pass `--sample-stack <your-stack-name>`.
+
+> **These two scripts only work against the bundled sample app.** They break and restore
+> a DynamoDB sentinel item that is specific to `sample-app/`, so they cannot exercise your
+> own application's dependency — and they refuse to run if `--table` points at a table that
+> isn't the sample app's. **To prove the alerting path against your own app**, either
+> redeploy with a deliberately tight budget (`--slo-ms 1`) so healthy responses breach the
+> latency SLO and the alarm fires without touching your backend, or briefly break the
+> dependency your health endpoint probes (revoke the reader's permission, point it at an
+> unreachable host) and watch the canary report 503.
 
 > **One knob to know:** `SloMs` (default **3000 ms**) is the full response time a user experiences, **including any backend cold start** — cold-start slowness correctly counts against uptime rather than being hidden. Tighten it for a warm, steady-traffic service.
 
@@ -86,13 +105,30 @@ The infrastructure-as-code provisions the **monitoring stack only** — it does 
 
 1. **Amazon CloudWatch Synthetics canary** — runs on a schedule, calls the deep health endpoint, and asserts status + latency.
 2. **Canary IAM role** — least-privilege (`cloudwatch:PutMetricData` scoped to the Synthetics namespace, S3 artifact write, and ENI permissions in VPC mode).
-3. **Artifact Amazon S3 bucket** — HAR files, logs, and screenshots from each run.
-4. **Availability alarm** — on `SuccessPercent`.
-5. **Latency alarm** — on `Duration` vs. the SLO.
+3. **Artifact Amazon S3 bucket** — two JSON reports per run (~3.6 KB): `HttpRequestsReport.json` (status, headers, body, and the DNS/TCP/TLS/first-byte timing breakdown) and `SyntheticsReport-PASSED.json` / `-FAILED.json` (step results and, on failure, the stack trace). A 31-day lifecycle rule expires them. There is **no `.har` file and no screenshots** — both come from browser page navigation, and an HTTP step never opens a page; the `httpTimings` breakdown in the request report is the substitute. Canary logs go to CloudWatch Logs, not here.
+4. **Availability alarm** — on `SuccessPercent`; fires on the **first** failed run (a failed run is an outage).
+5. **Latency alarm** — on the per-step `Duration` vs. the SLO; fires when **2 of the last 3** runs breach it, so one cold start doesn't page you.
 6. **Amazon SNS topic** — breach notifications.
-7. **Amazon CloudWatch dashboard** — uptime %, latency, and pass/fail counts.
+7. **Amazon CloudWatch dashboard** (`<stack-name>-uptime`) — four widgets: **Availability % (SuccessPercent)** over time, **End-to-end latency** with the SLO drawn as a threshold line, **Cumulative uptime %** for the selected range, and **Total vs Failed runs**.
 
-**Cost:** roughly **$10/month per monitored endpoint** at a 5-minute cadence (about $52/month at 1-minute); VPC mode adds a NAT Gateway unless you use VPC endpoints. See the full breakdown in [DEPLOYMENT.md → Cost](DEPLOYMENT.md#cost).
+**Cost:** roughly **$10.50/month per monitored endpoint** at a 5-minute cadence (about $52/month at 1-minute) — almost all of it the canary runs themselves, at $0.0012 each. Alarms and the dashboard are free within the account-wide free tiers ($3.20/month beyond them), and the canary's metrics are included in the run price rather than billed as custom metrics. VPC mode adds a NAT Gateway (~$33/month) unless you use VPC endpoints. See the verified breakdown in [DEPLOYMENT.md → Cost](DEPLOYMENT.md#cost).
+
+## The dashboard
+
+![CloudWatch dashboard with four widgets. Availability % holds at 100% then drops to 0% for about twenty minutes before recovering. End-to-end latency runs near 100 ms with a 1.4-second cold-start spike. Cumulative uptime % reads 86.6%. Total vs Failed runs reads 142 total and 19 failed.](images/dashboard.png)
+
+The four widgets above, captured during a real induced outage (`test/break-dependency.sh`, then
+`test/restore-dependency.sh`). The dip is the sample app's DynamoDB dependency being broken and
+restored — the canary caught every failed run, and the availability alarm fired on the first one.
+
+Two things worth reading off this screenshot:
+
+- **The bottom two widgets agree exactly.** 19 of 142 runs failed, and cumulative uptime reads
+  **86.6%** — which is `(142 − 19) / 142`. Those are two different statistics on the same metric
+  arriving at the same answer, which is the whole basis of the calculation in the next section.
+- **The 1.4-second spike is a real cold start**, not monitoring overhead. The latency widget plots
+  the **per-step** `Duration`, so it measures the HTTP round trip a user would have waited for —
+  canary runtime boot time is excluded.
 
 ## How uptime is calculated
 
@@ -118,7 +154,7 @@ Copy the reference handler closest to your stack from [`handlers/`](handlers/) a
 ## Repository layout
 
 ```
-deep-health-uptime-canary/
+sample-deep-health-uptime-canary/
 ├── README.md              ← you are here
 ├── DEPLOYMENT.md          ← full deployment & teardown guide
 ├── LICENSE                ← MIT-0
@@ -129,8 +165,9 @@ deep-health-uptime-canary/
 ├── canary/                ← CloudWatch Synthetics canary script
 ├── handlers/              ← reference deep-health handlers (Node.js & Python × 7 backends)
 ├── sample-app/            ← OPTIONAL serverless sample target app (≈ $0 at rest)
-├── test/                  ← contract test + break/restore-dependency failure-demo scripts
-└── images/                ← architecture diagrams
+├── test/                  ← contract test, failure-demo scripts, repository self-checks
+├── images/                ← architecture diagrams and dashboard screenshot
+└── .github/workflows/     ← CI: cfn-lint, shellcheck, JS/Python syntax, repo self-checks
 ```
 
 ## Documentation
@@ -140,7 +177,7 @@ deep-health-uptime-canary/
 
 ## Security
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for how to report security issues. The canary uses least-privilege IAM, reads only from a replica/reader with a bounded client and tight timeout, and tags its traffic as synthetic (`X-Synthetic: true`) so you can exclude it from real user metrics. Rate-limiting the public health path at your edge (an AWS WAF rate-based rule on your ALB / API Gateway / CloudFront) is recommended — see [DEPLOYMENT.md](DEPLOYMENT.md#protecting-the-health-path-recommended).
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for how to report security issues. The canary uses least-privilege IAM and holds no backend credentials — it only makes the HTTP call (the deep-health handler is what reads from a replica/reader with a bounded client and tight timeout). The canary tags its traffic as synthetic (`X-Synthetic: true`) so you can exclude it from real user metrics. The health path is rate-limited in two layers: every reference handler throttles it in-app (60 requests per client IP per minute by default), and an AWS WAF rate-based rule at your edge (on your ALB / API Gateway / CloudFront) is recommended as the primary control — see [DEPLOYMENT.md](DEPLOYMENT.md#protecting-the-health-path-recommended).
 
 ## License
 

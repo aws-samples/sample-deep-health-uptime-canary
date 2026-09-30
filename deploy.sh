@@ -18,6 +18,8 @@
 #   --bucket <name>             S3 bucket for packaged templates (default: auto-created per account/region).
 #   --schedule <expr>           Canary schedule (default: "rate(5 minutes)").
 #   --slo-ms <n>                End-to-end latency SLO in ms, incl. cold start (default: 3000).
+#   --alarm-period <seconds>    Alarm evaluation period: 60|300|900|3600. Derived from --schedule
+#                               automatically; pass this only to override the derived value.
 #   --alarm-email <email>       Email subscribed to the alarm SNS topic (optional).
 #   --vpc-subnets <ids>         Private subnet IDs (comma-separated) to run the canary in VPC mode
 #                               (private endpoints). Non-VPC if omitted. 2+ in different AZs recommended.
@@ -37,6 +39,7 @@ TARGET_URL=""
 BUCKET=""
 SCHEDULE="rate(5 minutes)"
 SLO_MS="3000"
+ALARM_PERIOD="300"
 ALARM_EMAIL=""
 VPC_ID=""
 VPC_SUBNETS=""
@@ -49,12 +52,36 @@ TAGS=( "project=deep-health-uptime-canary" "managed-by=cloudformation" )
 
 # Track which values the user passed explicitly, so interactive prompts only
 # ask for the ones left at their default (and never override a flag).
-STACK_NAME_SET="no"; SCHEDULE_SET="no"; ALARM_EMAIL_SET="no"; SAMPLE_SET="no"; TARGET_URL_SET="no"; VPC_SET="no"; SLO_MS_SET="no"
+STACK_NAME_SET="no"; SCHEDULE_SET="no"; ALARM_EMAIL_SET="no"; SAMPLE_SET="no"; TARGET_URL_SET="no"; VPC_SET="no"; SLO_MS_SET="no"; ALARM_PERIOD_SET="no"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_TEMPLATE="${ROOT_DIR}/iac/cloudformation/deploy.yaml"
 
 die() { echo "Error: $*" >&2; exit 1; }
+
+# Derive the CloudWatch alarm evaluation period from the probe schedule.
+# CloudWatch evaluates an alarm once per period, so a period SHORTER than the probe
+# interval leaves most periods with no datapoint: the availability alarm stalls on
+# stale state and the latency alarm flaps ALARM->OK between runs. Snap up to the
+# smallest allowed period (60|300|900|3600) that is >= the probe interval.
+# Prints the period and returns 0, or returns 1 for a form we can't parse (cron).
+derive_alarm_period() {
+  local expr="$1" n unit mins
+  if [[ "${expr}" =~ ^rate\(([0-9]+)[[:space:]]+(minute|minutes|hour|hours)\)$ ]]; then
+    n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    case "${unit}" in
+      hour|hours) mins=$(( n * 60 )) ;;
+      *)          mins="${n}" ;;
+    esac
+    if   (( mins <= 1  )); then echo 60
+    elif (( mins <= 5  )); then echo 300
+    elif (( mins <= 15 )); then echo 900
+    else                        echo 3600
+    fi
+    return 0
+  fi
+  return 1
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,6 +91,7 @@ while [[ $# -gt 0 ]]; do
     --bucket)       BUCKET="${2:-}"; shift 2 ;;
     --schedule)     SCHEDULE="${2:-}"; SCHEDULE_SET="yes"; shift 2 ;;
     --slo-ms)       SLO_MS="${2:-}"; SLO_MS_SET="yes"; shift 2 ;;
+    --alarm-period) ALARM_PERIOD="${2:-}"; ALARM_PERIOD_SET="yes"; shift 2 ;;
     --alarm-email)  ALARM_EMAIL="${2:-}"; ALARM_EMAIL_SET="yes"; shift 2 ;;
     --vpc-id)       VPC_ID="${2:-}"; VPC_SET="yes"; shift 2 ;;
     --vpc-subnets)  VPC_SUBNETS="${2:-}"; VPC_SET="yes"; shift 2 ;;
@@ -71,12 +99,30 @@ while [[ $# -gt 0 ]]; do
     --skip-egress-check) SKIP_EGRESS_CHECK="yes"; shift ;;
     --tag)          TAGS+=( "${2:-}" ); shift 2 ;;
     --region)       REGION="${2:-}"; shift 2 ;;
-    -h|--help)      sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "Unknown option: $1 (use --help)" ;;
   esac
 done
 
 command -v aws >/dev/null 2>&1 || die "AWS CLI not found on PATH."
+
+# The stack name prefixes every resource, including the Synthetics canary name, so it must
+# satisfy the STRICTEST of the constraints in play: a CloudFormation stack name starts with
+# a letter and allows only letters/digits/hyphens (no underscore), and a canary name is
+# lowercase and at most 21 characters. Validate here so a bad --stack-name fails
+# immediately with a clear message instead of deep inside CloudFormation.
+STACK_NAME_RE='^[a-z][a-z0-9-]{0,20}$'
+valid_stack_name() { [[ "$1" =~ ${STACK_NAME_RE} ]]; }
+valid_stack_name "${STACK_NAME}" || die "Invalid --stack-name '${STACK_NAME}': must be 1-21 characters, start with a lowercase letter, and contain only lowercase letters, digits and hyphens (it prefixes the Synthetics canary name)."
+
+# The target URL must carry a scheme — it is passed to the canary as a full URL and the
+# template enforces the same pattern (TargetUrl AllowedPattern). Catching it here avoids
+# packaging and uploading templates only to have CloudFormation reject the parameter.
+valid_target_url() { [[ "$1" =~ ^https?://.+ ]]; }
+if [[ -n "${TARGET_URL}" ]]; then
+  valid_target_url "${TARGET_URL}" \
+    || die "Invalid --target-url '${TARGET_URL}': must be a full URL including the scheme, e.g. https://app.example.com/health/deep."
+fi
 
 # Resolve region early (needed to detect the stack and to run the egress check).
 if [[ -z "${REGION}" ]]; then
@@ -88,10 +134,26 @@ fi
 # reuse the deployed parameter values for anything not passed as a flag, so a targeted
 # change (e.g. just --target-url) never clobbers the existing schedule / SLO / email / VPC.
 STACK_EXISTS="no"
+DEPLOYED_PARAM_KEYS=""
+DEPLOYED_SCHEDULE=""
 if aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${REGION}" >/dev/null 2>&1; then
   STACK_EXISTS="yes"
   echo "Stack '${STACK_NAME}' exists — updating in place. Unspecified values keep their current deployed settings."
+  # Which parameters the DEPLOYED stack actually has. UsePreviousValue is only legal for
+  # parameters that already exist on the stack, so upgrading from an older version of this
+  # repo (which had fewer parameters) must send a concrete value for the new ones instead.
+  DEPLOYED_PARAM_KEYS="$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${REGION}" \
+    --query "Stacks[0].Parameters[].ParameterKey" --output text 2>/dev/null | tr '\t' ' ' || true)"
+  # The deployed schedule, so the alarm period can be derived from what is ACTUALLY
+  # running when the user updates without passing --schedule.
+  DEPLOYED_SCHEDULE="$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${REGION}" \
+    --query "Stacks[0].Parameters[?ParameterKey=='ScheduleExpression'].ParameterValue" --output text 2>/dev/null || true)"
 fi
+
+# True when the deployed stack already carries this parameter (so UsePreviousValue is safe).
+has_deployed_param() {
+  [[ " ${DEPLOYED_PARAM_KEYS} " == *" $1 "* ]]
+}
 
 # ---- Interactive prompts (only when attached to a terminal) ----
 # Prompt for common options the user did NOT pass as flags. In non-interactive
@@ -103,8 +165,8 @@ if [[ -t 0 && "${STACK_EXISTS}" == "no" ]]; then
     while true; do
       read -r -p "Stack name (prefixes all resources) [${STACK_NAME}]: " _ans
       _ans="${_ans:-${STACK_NAME}}"
-      if [[ "${_ans}" =~ ^[a-z0-9][a-z0-9_-]{0,20}$ ]]; then STACK_NAME="${_ans}"; break; fi
-      echo "  Invalid: must be 1-21 chars, lowercase letters/digits/-/_, starting with a letter or digit."
+      if valid_stack_name "${_ans}"; then STACK_NAME="${_ans}"; break; fi
+      echo "  Invalid: must be 1-21 chars of lowercase letters, digits and hyphens, starting with a letter."
     done
   fi
   # Sample app — offer to deploy the bundled sample target for end-to-end testing.
@@ -114,10 +176,14 @@ if [[ -t 0 && "${STACK_EXISTS}" == "no" ]]; then
       y|Y|yes|YES) DEPLOY_SAMPLE="yes" ;;
       *)
         DEPLOY_SAMPLE="no"
-        # No sample app -> we need a target URL to monitor; prompt until non-empty.
-        while [[ -z "${TARGET_URL}" ]]; do
+        # No sample app -> we need a target URL to monitor; prompt until it is a full URL.
+        while ! valid_target_url "${TARGET_URL}"; do
           read -r -p "Your /health/deep URL to monitor: " TARGET_URL
-          [[ -z "${TARGET_URL}" ]] && echo "  A target URL is required when not deploying the sample app."
+          if [[ -z "${TARGET_URL}" ]]; then
+            echo "  A target URL is required when not deploying the sample app."
+          elif ! valid_target_url "${TARGET_URL}"; then
+            echo "  Include the scheme, e.g. https://app.example.com/health/deep."
+          fi
         done
         # Networking mode: public endpoint -> non-VPC (default); private -> VPC mode
         # (canary gets ENIs in your subnets). Only asked for your-own-endpoint deploys;
@@ -180,6 +246,30 @@ if [[ -t 0 && "${STACK_EXISTS}" == "no" ]]; then
   fi
 fi
 
+# ---- Alarm period: keep it in step with the probe interval ----------------------
+# An explicit --alarm-period always wins, but it must be one of the values the
+# template accepts — fail fast here rather than letting CloudFormation reject it.
+if [[ "${ALARM_PERIOD_SET}" == "yes" ]]; then
+  case "${ALARM_PERIOD}" in
+    60|300|900|3600) : ;;
+    *) die "--alarm-period must be one of 60, 300, 900, 3600 (seconds). Got '${ALARM_PERIOD}'." ;;
+  esac
+# Otherwise derive it from the schedule that will actually be in effect: the one passed
+# / prompted for, or — on an update where --schedule was not given — the deployed one.
+else
+  EFFECTIVE_SCHEDULE="${SCHEDULE}"
+  if [[ "${STACK_EXISTS}" == "yes" && "${SCHEDULE_SET}" == "no" && -n "${DEPLOYED_SCHEDULE}" && "${DEPLOYED_SCHEDULE}" != "None" ]]; then
+    EFFECTIVE_SCHEDULE="${DEPLOYED_SCHEDULE}"
+  fi
+  if _derived="$(derive_alarm_period "${EFFECTIVE_SCHEDULE}")"; then
+    ALARM_PERIOD="${_derived}"
+    echo "Alarm period: ${ALARM_PERIOD}s (derived from ${EFFECTIVE_SCHEDULE})."
+  else
+    echo "Note: can't derive an alarm period from '${EFFECTIVE_SCHEDULE}' — using ${ALARM_PERIOD}s." >&2
+    echo "      If your probe interval is longer than ${ALARM_PERIOD}s, pass --alarm-period (60|300|900|3600) to match it, or the alarms will flap." >&2
+  fi
+fi
+
 # Must monitor something: either the sample app or a user-supplied target URL.
 # Only required on CREATE — on an UPDATE the deployed stack already has a target
 # (TargetUrl / sample app), which is kept via UsePreviousValue when not re-supplied.
@@ -223,6 +313,14 @@ fi
 # no NAT route AND the VPC has no S3 + CloudWatch/logs endpoints, every run will fail
 # and the user pays for a broken monitor. Refuse in that case (override with
 # --skip-egress-check for setups the script can't see, e.g. TGW/central-egress/proxy).
+# The security group the stack creates for VPC mode allows egress on 443 ONLY, so a
+# plain-http private target would be blocked and every run would fail. Warn (don't
+# refuse — the user may be about to pass their own SG, and http targets are legitimate).
+if [[ -n "${VPC_SUBNETS}" && -z "${SECURITY_GROUP}" && "${TARGET_URL}" == http://* ]]; then
+  echo "Warning: the target URL is plain http, but the security group this stack creates for VPC mode allows egress on 443 only — the canary would not reach it." >&2
+  echo "         Use an https endpoint, or pass --security-group <sg-...> with an egress rule for the target port." >&2
+fi
+
 if [[ -n "${VPC_SUBNETS}" && "${SKIP_EGRESS_CHECK}" == "no" ]]; then
   echo "Checking VPC egress for the canary subnets ..."
   # Evaluate BOTH paths (no short-circuit). The canary does not choose the path —
@@ -238,13 +336,17 @@ if [[ -n "${VPC_SUBNETS}" && "${SKIP_EGRESS_CHECK}" == "no" ]]; then
     # use the main table). We must resolve the VPC first to find the main table.
     _sn_vpc="$(aws ec2 describe-subnets --region "${REGION}" --subnet-ids "${_sn}" \
       --query 'Subnets[0].VpcId' --output text 2>/dev/null || true)"
-    # 1) explicit association
+    # 1) explicit association.
+    # The --query single quotes are REQUIRED: the backticks are JMESPath literal
+    # syntax, and double-quoting would make the shell run them as commands.
+    # shellcheck disable=SC2016
     _nat="$(aws ec2 describe-route-tables --region "${REGION}" \
       --filters "Name=association.subnet-id,Values=${_sn}" \
       --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0` && NatGatewayId!=`null`].NatGatewayId' \
       --output text 2>/dev/null || true)"
     # 2) fall back to the VPC main route table if no explicit association matched
     if [[ ( -z "${_nat}" || "${_nat}" == "None" ) && -n "${_sn_vpc}" && "${_sn_vpc}" != "None" ]]; then
+      # shellcheck disable=SC2016  # JMESPath backtick literals — see above.
       _nat="$(aws ec2 describe-route-tables --region "${REGION}" \
         --filters "Name=vpc-id,Values=${_sn_vpc}" "Name=association.main,Values=true" \
         --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0` && NatGatewayId!=`null`].NatGatewayId' \
@@ -313,10 +415,13 @@ if [[ -z "${BUCKET}" ]]; then
     fi
     aws s3api put-bucket-encryption --bucket "${BUCKET}" \
       --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+    aws s3api put-public-access-block --bucket "${BUCKET}" \
+      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
   fi
 fi
 
 PACKAGED="$(mktemp -t dhuc-packaged-XXXX).yaml"
+trap 'rm -f "${PACKAGED}"' EXIT   # clean up the packaged-template temp file on any exit
 echo "Packaging nested templates to s3://${BUCKET} ..."
 aws cloudformation package \
   --template-file "${ROOT_TEMPLATE}" \
@@ -333,7 +438,7 @@ aws cloudformation package \
 PARAMS=()
 if [[ "${STACK_EXISTS}" == "no" ]]; then
   # --- CREATE ---
-  PARAMS+=( "DeploySampleApp=${DEPLOY_SAMPLE}" "ScheduleExpression=${SCHEDULE}" "SloMs=${SLO_MS}" )
+  PARAMS+=( "DeploySampleApp=${DEPLOY_SAMPLE}" "ScheduleExpression=${SCHEDULE}" "SloMs=${SLO_MS}" "AlarmPeriodSeconds=${ALARM_PERIOD}" )
   [[ -n "${TARGET_URL}"  ]] && PARAMS+=( "TargetUrl=${TARGET_URL}" )
   [[ -n "${ALARM_EMAIL}" ]] && PARAMS+=( "AlarmEmail=${ALARM_EMAIL}" )
   [[ -n "${VPC_SUBNETS}" ]] && PARAMS+=( "VpcSubnetIds=${VPC_SUBNETS}" )
@@ -345,6 +450,14 @@ else
   if [[ "${SAMPLE_SET}" == "yes" || "${TARGET_URL_SET}" == "yes" ]]; then PARAMS+=( "DeploySampleApp=${DEPLOY_SAMPLE}" ); else PARAMS+=( "ParameterKey=DeploySampleApp,UsePreviousValue=true" ); fi
   if [[ "${SCHEDULE_SET}" == "yes" ]]; then PARAMS+=( "ScheduleExpression=${SCHEDULE}" ); else PARAMS+=( "ParameterKey=ScheduleExpression,UsePreviousValue=true" ); fi
   if [[ "${SLO_MS_SET}" == "yes" ]]; then PARAMS+=( "SloMs=${SLO_MS}" ); else PARAMS+=( "ParameterKey=SloMs,UsePreviousValue=true" ); fi
+  # Send a new alarm period only when it was set explicitly or re-derived from a changed
+  # --schedule; otherwise keep the deployed value so the two stay consistent. A stack
+  # deployed before this parameter existed has nothing to keep, so send the value.
+  if [[ "${ALARM_PERIOD_SET}" == "yes" || "${SCHEDULE_SET}" == "yes" ]] || ! has_deployed_param AlarmPeriodSeconds; then
+    PARAMS+=( "AlarmPeriodSeconds=${ALARM_PERIOD}" )
+  else
+    PARAMS+=( "ParameterKey=AlarmPeriodSeconds,UsePreviousValue=true" )
+  fi
   if [[ "${TARGET_URL_SET}" == "yes" ]]; then PARAMS+=( "TargetUrl=${TARGET_URL}" ); else PARAMS+=( "ParameterKey=TargetUrl,UsePreviousValue=true" ); fi
   if [[ "${ALARM_EMAIL_SET}" == "yes" ]]; then PARAMS+=( "AlarmEmail=${ALARM_EMAIL}" ); else PARAMS+=( "ParameterKey=AlarmEmail,UsePreviousValue=true" ); fi
   if [[ "${VPC_SET}" == "yes" ]]; then

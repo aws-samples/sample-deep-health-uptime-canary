@@ -18,6 +18,21 @@ Parameters:
       Optional explicit DynamoDB table name. Leave empty to let CloudFormation
       auto-name it. The root deploy stack passes a clean stack-based name
       (e.g. <root-stack>-health) so the table is easy to find and collision-safe.
+  ApiThrottleRateLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: >-
+      Steady-state request rate (requests/second) allowed on the sample app's HTTP
+      API. Keep it well above your combined probe rate — the canary probes at most
+      once a minute, and a throttled probe is recorded as a failed run (a false outage).
+  ApiThrottleBurstLimit:
+    Type: Number
+    Default: 40
+    MinValue: 1
+    Description: >-
+      Burst capacity (concurrent requests) allowed on the sample app's HTTP API.
+      Should be at least the steady-state rate above.
 
 Conditions:
   HasTableName: !Not [ !Equals [ !Ref TableName, '' ] ]
@@ -69,12 +84,18 @@ Resources:
         ZipFile: |
           const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
           const https = require('https');
-          const send = (event, ctx, status, data) => new Promise((res) => {
-            const body = JSON.stringify({ Status: status, PhysicalResourceId: 'seed', StackId: event.StackId,
+          // Minimal cfn-response. `Reason` is what CloudFormation surfaces in the stack
+          // events on FAILED, so it is set from the error rather than only tucked into Data.
+          // content-length must be the BYTE length (Buffer.byteLength), not the character
+          // count — a non-ASCII character in the error text would otherwise truncate the
+          // body and the pre-signed PUT would be rejected, hanging the stack for an hour.
+          const send = (event, ctx, status, reason, data) => new Promise((res) => {
+            const body = JSON.stringify({ Status: status, Reason: reason || 'See CloudWatch log ' + ctx.logStreamName,
+              PhysicalResourceId: 'seed', StackId: event.StackId,
               RequestId: event.RequestId, LogicalResourceId: event.LogicalResourceId, Data: data || {} });
             const u = new URL(event.ResponseURL);
             const req = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'PUT',
-              headers: { 'content-type': '', 'content-length': body.length } }, () => res());
+              headers: { 'content-type': '', 'content-length': Buffer.byteLength(body) } }, () => res());
             req.on('error', () => res()); req.write(body); req.end();
           });
           exports.handler = async (event, ctx) => {
@@ -84,8 +105,8 @@ Resources:
                 await ddb.send(new PutItemCommand({ TableName: event.ResourceProperties.TableName,
                   Item: { id: { S: 'health-sentinel' }, ok: { BOOL: true } } }));
               }
-              await send(event, ctx, 'SUCCESS');
-            } catch (e) { await send(event, ctx, 'FAILED', { error: String(e) }); }
+              await send(event, ctx, 'SUCCESS', 'OK');
+            } catch (e) { await send(event, ctx, 'FAILED', String(e), { error: String(e) }); }
           };
 
   AppFunctionRole:
@@ -123,7 +144,7 @@ Resources:
           // Sample /health/deep — read-only GetItem on a sentinel key (single-digit ms).
           // Mirrors handlers/node/dynamodb with the standard contract.
           //
-          // Latency breakdown: this handler emits three CloudWatch metrics via EMF
+          // Latency breakdown: this handler emits two CloudWatch metrics via EMF
           // (Embedded Metric Format — just a structured log line, no extra API call,
           // no added request latency):
           //   DbQueryMs   — the dependency (DynamoDB GetItem) round-trip time
@@ -134,15 +155,21 @@ Resources:
           // via CloudWatch Logs Insights — see DEPLOYMENT.md. We do NOT synthesize a
           // cold-start metric in-handler (that would include idle wait, not just init).
           const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
-          const ddb = new DynamoDBClient({ maxAttempts: 1 });
+          // Bounded client: no retries and an explicit socket timeout, so a slow or
+          // unreachable dependency fails FAST as 503 instead of hanging until the Lambda
+          // timeout. This is the same isolation rule the reference handlers follow
+          // (handlers/README.md) — a health probe must never queue behind a stuck socket.
+          const ddb = new DynamoDBClient({
+            maxAttempts: 1,
+            requestHandler: { connectionTimeout: 500, requestTimeout: 1000 },
+          });
           // Emit a metric via EMF. metrics = [{name, value, unit}]; dims picked up from properties.
-          // NOTE: this sample hardcodes the Service dimension to 'deep-health-sample', which is
-          // exactly what the dashboard's latency-breakdown widgets query. Your OWN app, using the
-          // shared handlers/node/emf.js helper, defaults the Service dimension to 'deep-health'
-          // (override with the METRIC_SERVICE env var). If you retarget the canary at your app and
-          // want the breakdown widgets to show its data, set METRIC_SERVICE to match the value the
-          // dashboard queries (or edit the dashboard's Service dimension). This affects only the
-          // diagnostic breakdown row — never the uptime verdict, which the canary judges end-to-end.
+          // NOTE: this sample emits the breakdown metrics under Service='deep-health-sample'.
+          // These metrics are DIAGNOSTIC and are NOT shown on the monitoring dashboard by default;
+          // view them in CloudWatch -> Metrics under namespace DeepHealth/Breakdown, or add your own
+          // widget. Your own app using the shared handlers/node/emf.js helper defaults the Service
+          // dimension to 'deep-health' (override with the METRIC_SERVICE env var). Either way this
+          // never affects the uptime verdict, which the canary judges end-to-end.
           function emit(metrics, props) {
             const ns = process.env.METRIC_NAMESPACE || 'DeepHealth/Breakdown';
             const rec = { _aws: { Timestamp: Date.now(), CloudWatchMetrics: [ {
@@ -156,7 +183,7 @@ Resources:
             const path = event.rawPath || (event.requestContext && event.requestContext.http && event.requestContext.http.path) || '/';
             const t0 = Date.now();
             if (path !== '/health/deep') {
-              return { statusCode: 200, headers: { 'content-type': 'application/json' },
+              return { statusCode: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
                 body: JSON.stringify({ app: 'sample', message: 'ok — try /health/deep' }) };
             }
             try {
@@ -169,11 +196,11 @@ Resources:
               // Diagnostic breakdown metrics (cold start comes from Lambda @initDuration, not here).
               const metrics = [ { name: 'DbQueryMs', value: dbQueryMs }, { name: 'TotalMs', value: totalMs } ];
               emit(metrics);
-              return { statusCode: 200, headers: { 'content-type': 'application/json' },
+              return { statusCode: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
                 body: JSON.stringify({ status: 'ok', db: 'ok', latencyMs: totalMs, dbQueryMs }) };
             } catch (e) {
               const kind = /timeout/i.test(String(e)) ? 'timeout' : 'error';
-              return { statusCode: 503, headers: { 'content-type': 'application/json' },
+              return { statusCode: 503, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
                 body: JSON.stringify({ status: 'degraded', db: kind, latencyMs: Date.now() - t0 }) };
             }
           };
@@ -205,6 +232,28 @@ Resources:
       FunctionName: !Ref AppFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # Throttle the API. /health/deep is public and unauthenticated, and every request
+  # costs a real DynamoDB call, so an unthrottled endpoint is a cheap amplification
+  # target — the same reason the reference handlers rate-limit themselves
+  # (handlers/README.md). This is the edge-layer control for the sample app: a
+  # REGIONAL WAF Web ACL cannot attach to an HTTP API, only to a REST API.
+  #
+  # ApiGatewayManagedOverrides is how you configure the '$default' stage that the
+  # quick-create API above (Target: ...) creates implicitly — there is no
+  # AWS::ApiGatewayV2::Stage resource to attach settings to, and declaring one would
+  # mean giving up quick-create. DefaultRouteSettings applies to every route.
+  #
+  # The limits are generous on purpose: the canary probes at most once a minute, and
+  # a 429 to the canary would be recorded as a failed run, i.e. a false outage.
+  ApiThrottling:
+    Type: AWS::ApiGatewayV2::ApiGatewayManagedOverrides
+    Properties:
+      ApiId: !Ref HttpApi
+      Stage:
+        DefaultRouteSettings:
+          ThrottlingRateLimit: !Ref ApiThrottleRateLimit
+          ThrottlingBurstLimit: !Ref ApiThrottleBurstLimit
 
 Outputs:
   SampleAppUrl:

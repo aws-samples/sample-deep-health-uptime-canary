@@ -12,9 +12,24 @@
  * DocumentDB requires the Amazon RDS CA bundle for TLS (rds-combined-ca-bundle.pem).
  */
 const express = require('express');
+const { rateLimit } = require('express-rate-limit');
 const { MongoClient, ReadPreference } = require('mongodb');
 
 const app = express();
+
+// Rate-limit the public health path: it is unauthenticated and every request costs a
+// real dependency call. Defence in depth — an AWS WAF rate-based rule at the edge is
+// the primary control. The limit is generous on purpose: a 429 to the canary would be
+// recorded as a failed run, i.e. a false outage. See handlers/README.md for the
+// trust-proxy caveat — get it wrong and the limiter throttles everyone, canary included.
+app.set('trust proxy', 1);   // proxy hops in front of this app (ALB / API Gateway / CloudFront)
+const healthLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: Number(process.env.HEALTH_RATE_LIMIT || 60),   // per client IP, per minute
+  standardHeaders: 'draft-7',                           // RateLimit + Retry-After headers
+  legacyHeaders: false,
+  message: { error: 'rate limited' },                   // 429 — deliberately not the 503 contract body
+});
 
 // One shared, bounded client reused across requests (do not create per request).
 const client = new MongoClient(process.env.DOCDB_URI, {
@@ -31,7 +46,7 @@ async function getClient() {
   return client;
 }
 
-app.get('/health/deep', async (req, res) => {
+app.get('/health/deep', healthLimiter, async (req, res) => {
   // Never let a CDN/proxy cache a health response — a cached 200 would mask a real outage.
   res.set('Cache-Control', 'no-store');
   const t0 = Date.now();

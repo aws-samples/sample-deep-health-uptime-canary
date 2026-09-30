@@ -3,15 +3,19 @@
 # needs a subset. Copy the folder matching your datastore into your app and install
 # what it imports.
 #
-#   aurora-postgres  -> fastapi, uvicorn, asyncpg
-#   dynamodb / s3    -> fastapi, uvicorn, boto3
-#   documentdb       -> fastapi, uvicorn, pymongo
-#   elasticache-redis-> fastapi, uvicorn, redis
-#   opensearch       -> fastapi, uvicorn        (urllib is stdlib)
-#   external-api     -> fastapi, uvicorn        (urllib is stdlib)
+# Every handler needs fastapi + uvicorn + slowapi (slowapi rate-limits the public
+# health path), plus its own driver:
+#
+#   aurora-postgres  -> asyncpg
+#   dynamodb / s3    -> boto3
+#   documentdb       -> pymongo
+#   elasticache-redis-> redis
+#   opensearch       -> (none — urllib is stdlib)
+#   external-api     -> (none — urllib is stdlib)
 
 fastapi>=0.110,<1.0
 uvicorn>=0.29,<1.0
+slowapi>=0.1.9,<0.2
 asyncpg>=0.29,<1.0
 boto3>=1.34,<2.0
 pymongo>=4.6,<5.0

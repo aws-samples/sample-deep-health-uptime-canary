@@ -10,7 +10,7 @@ Metadata:
       - Label: { default: Target and schedule }
         Parameters: [ TargetUrl, CanaryName, ScheduleExpression, SloMs ]
       - Label: { default: Alarms }
-        Parameters: [ AlarmEmail ]
+        Parameters: [ AlarmEmail, AlarmPeriodSeconds ]
       - Label: { default: VPC mode (private endpoints only - leave blank for public) }
         Parameters: [ VpcId, VpcSubnetIds, CanarySecurityGroupId ]
     ParameterLabels:
@@ -19,6 +19,7 @@ Metadata:
       ScheduleExpression: { default: Probe schedule }
       SloMs: { default: End-to-end latency SLO (ms) }
       AlarmEmail: { default: Alarm notification email (optional) }
+      AlarmPeriodSeconds: { default: Alarm period (match your probe interval) }
       VpcId: { default: VPC ID (VPC mode) }
       VpcSubnetIds: { default: Private subnet IDs (VPC mode) }
       CanarySecurityGroupId: { default: Existing security group ID (optional) }
@@ -48,13 +49,24 @@ Parameters:
     Type: Number
     Default: 3000
     MinValue: 1
-    MaxValue: 30000
+    MaxValue: 10000
     Description: >-
       End-to-end latency SLO in milliseconds. The canary fails a run if the FULL response
       time (as a user experiences it, INCLUDING any backend cold start) exceeds this. Set
       it to the real budget you promise users — do not shrink it to hide cold starts. A
       serverless target that can cold-start needs an honest budget (e.g. 3000ms); a
-      warm, steady-traffic service can use a tighter one.
+      warm, steady-traffic service can use a tighter one. Capped at 10000ms so the assertion
+      always evaluates within the canary run timeout (which also covers runtime boot).
+  AlarmPeriodSeconds:
+    Type: Number
+    Default: 300
+    AllowedValues: [ 60, 300, 900, 3600 ]
+    Description: >-
+      CloudWatch alarm evaluation period in seconds. MUST be >= your probe interval, or
+      most periods hold no run and the alarms flap. Rule of thumb:
+      rate(1 minute)->60, rate(5 minutes)->300, rate(15 minutes)->900, rate(1 hour)->3600.
+      deploy.sh and the root stack (deploy.yaml) derive this from ScheduleExpression
+      automatically — set it by hand only when deploying this template directly.
   AlarmEmail:
     Type: String
     Default: ''
@@ -145,6 +157,12 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}'
                   - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/*'
+              # The Synthetics runtime lists buckets to locate the artifact bucket; this action
+              # only supports "*" (it cannot be resource-scoped). It exposes only bucket NAMES,
+              # not contents. Matches AWS's documented canary execution policy.
+              - Effect: Allow
+                Action: [ s3:ListAllMyBuckets ]
+                Resource: '*'
               - Effect: Allow
                 Action: [ cloudwatch:PutMetricData ]
                 Resource: '*'
@@ -175,7 +193,11 @@ Resources:
         Expression: !Ref ScheduleExpression
         DurationInSeconds: '0'
       RunConfig:
-        TimeoutInSeconds: 30
+        # 45s covers canary runtime boot (~15s) plus the asserted HTTP round-trip (SloMs is
+        # capped at 10000ms for exactly this reason), so a run is never killed by the hard
+        # timeout before the latency check evaluates. Deliberately BELOW 60s: Synthetics
+        # rejects a timeout longer than the run frequency, and rate(1 minute) is supported.
+        TimeoutInSeconds: 45
         EnvironmentVariables:
           TARGET_URL: !Ref TargetUrl
           SLO_MS: !Ref SloMs
@@ -186,10 +208,16 @@ Resources:
           const log = require('@aws/synthetics-logger');
 
           // Uses the INSTRUMENTED HTTP step so the library emits the request-level
-          // 2xx/4xx/5xx metrics + per-step Duration + a HAR. A raw https.get would
-          // publish none of those, leaving the uptime widget blank. Availability on
-          // the dashboard is computed from SuccessPercent (run-level), not from the
-          // per-request 2xx count. Keep in sync with canary/deep-health.js.
+          // 2xx/4xx/5xx metrics + per-step Duration, and writes a step report per run.
+          // A raw https.get creates no step, so there is no per-step Duration (the
+          // metric the latency alarm uses) and no step report. Availability on the
+          // dashboard is computed from SuccessPercent (run-level), not from the
+          // per-request 2xx count. Two S3 objects per run: HttpRequestsReport.json
+          // and SyntheticsReport-<STATUS>.json. No .har, no screenshots (an HTTP step
+          // never opens a page); canary logs go to CloudWatch Logs, not S3.
+          //
+          // MIRRORS canary/deep-health.js, which is the source of truth and carries the
+          // full commentary. `python3 test/repo_checks.py` fails if the two drift.
           const deepHealthCheck = async function () {
             const url = process.env.TARGET_URL;
             const sloMs = parseInt(process.env.SLO_MS || '3000', 10);
@@ -204,11 +232,19 @@ Resources:
               protocol: u.protocol,
               headers: { 'X-Synthetic': 'true' },
             };
-            const stepConfig = {
+            // Header/body capture MUST be set on the GLOBAL configuration — passing
+            // these in executeHttpStep's stepConfig is silently ignored (a live run
+            // recorded "headers": "Not enabled" and an empty body). restrictedHeaders
+            // redacts credentials so they never land in the S3 artifact.
+            synthetics.getConfiguration().setConfig({
               includeRequestHeaders: true,
               includeResponseHeaders: true,
               includeRequestBody: false,
               includeResponseBody: true,
+              restrictedHeaders: ['authorization', 'cookie', 'set-cookie', 'x-api-key', 'x-amz-security-token'],
+            });
+
+            const stepConfig = {
               continueOnHttpStepFailure: false,
             };
 
@@ -217,7 +253,7 @@ Resources:
             const validate = async function (res) {
               return await new Promise((resolve, reject) => {
                 let data = '';
-                res.on('data', (c) => { data += c; });
+                res.on('data', (chunk) => { data += chunk; });
                 res.on('end', () => {
                   capturedBody = data;
                   if (res.statusCode < 200 || res.statusCode > 299) {
@@ -234,7 +270,9 @@ Resources:
 
             const latency = Date.now() - start;
             log.info(`Deep health round-trip: ${latency}ms (SLO ${sloMs}ms)`);
-            if (latency > sloMs) throw new Error(`Latency ${latency}ms exceeds SLO ${sloMs}ms`);
+            if (latency > sloMs) {
+              throw new Error(`Latency ${latency}ms exceeds SLO ${sloMs}ms`);
+            }
 
             let parsed;
             try {
@@ -245,9 +283,13 @@ Resources:
             if (parsed.status !== 'ok') {
               throw new Error(`Endpoint reported degraded: ${JSON.stringify(parsed)}`);
             }
+
+            log.info('Deep health check passed.');
           };
 
-          exports.handler = async () => { return await deepHealthCheck(); };
+          exports.handler = async () => {
+            return await deepHealthCheck();
+          };
       VPCConfig: !If
         - IsVpcMode
         - SubnetIds: !Ref VpcSubnetIds
@@ -278,12 +320,13 @@ Resources:
       Dimensions:
         - { Name: CanaryName, Value: !Ref CanaryName }
       Statistic: Average
-      Period: 300
+      Period: !Ref AlarmPeriodSeconds
       EvaluationPeriods: 1
       Threshold: 100
       ComparisonOperator: LessThanThreshold
-      # 'missing' (not 'breaching') so schedules slower than the 5-min period do not
-      # sit in permanent ALARM on periods that legitimately have no run datapoint.
+      # A single failed run IS an outage, so no debounce here — page on the first bad
+      # datapoint. 'missing' (not 'breaching') so a period that legitimately has no run
+      # datapoint (scheduling jitter, a paused canary) does not create a false ALARM.
       TreatMissingData: missing
       AlarmActions: [ !Ref AlarmTopic ]
       OKActions: [ !Ref AlarmTopic ]
@@ -294,7 +337,7 @@ Resources:
       AlarmName: !Sub '${CanaryName}-latency'
       AlarmDescription: >-
         HTTP round-trip time of the deep-health step (the real end-to-end time a user waits,
-        including any backend cold start) stayed above the SLO for 3 consecutive runs. Uses the
+        including any backend cold start) exceeded the SLO in 2 of the last 3 runs. Uses the
         per-step Duration (StepName=deep-health), NOT the whole-canary run Duration, so canary
         runtime boot time does not trip the alarm.
       Namespace: CloudWatchSynthetics
@@ -303,9 +346,13 @@ Resources:
         - { Name: CanaryName, Value: !Ref CanaryName }
         - { Name: StepName, Value: deep-health }
       Statistic: Average
-      Period: 300
+      Period: !Ref AlarmPeriodSeconds
+      # Debounced: 2 bad datapoints out of the last 3. Because AlarmPeriodSeconds tracks the
+      # probe interval, each period holds one run — so this means "2 of the last 3 runs were
+      # slow". A single cold start or network blip does not page anyone, and unlike 3-of-3 it
+      # still fires when scheduling jitter leaves one period without a datapoint.
       EvaluationPeriods: 3
-      DatapointsToAlarm: 3
+      DatapointsToAlarm: 2
       Threshold: !Ref SloMs
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
@@ -323,7 +370,7 @@ Resources:
               "properties": {
                 "title": "Availability % (SuccessPercent)",
                 "metrics": [[ "CloudWatchSynthetics", "SuccessPercent", "CanaryName", "${CanaryName}" ]],
-                "view": "timeSeries", "stat": "Average", "period": 300, "region": "${AWS::Region}",
+                "view": "timeSeries", "stat": "Average", "period": ${AlarmPeriodSeconds}, "region": "${AWS::Region}",
                 "yAxis": { "left": { "min": 0, "max": 100 } }
               }
             },
@@ -332,7 +379,10 @@ Resources:
               "properties": {
                 "title": "End-to-end latency \u2014 HTTP round-trip (ms)",
                 "metrics": [[ "CloudWatchSynthetics", "Duration", "CanaryName", "${CanaryName}", "StepName", "deep-health" ]],
-                "view": "timeSeries", "stat": "Average", "period": 300, "region": "${AWS::Region}"
+                "view": "timeSeries", "stat": "Average", "period": ${AlarmPeriodSeconds}, "region": "${AWS::Region}",
+                "annotations": { "horizontal": [
+                  { "label": "SLO (${SloMs} ms)", "value": ${SloMs}, "color": "#d62728" }
+                ] }
               }
             },
             {
@@ -348,12 +398,12 @@ Resources:
             {
               "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
               "properties": {
-                "title": "Passed (2xx) vs Failed runs",
+                "title": "Total vs Failed runs (over range)",
                 "metrics": [
-                  [ "CloudWatchSynthetics", "2xx", "CanaryName", "${CanaryName}", { "stat": "Sum", "label": "Passed (2xx)" } ],
-                  [ "CloudWatchSynthetics", "Failed", "CanaryName", "${CanaryName}", { "stat": "Sum", "label": "Failed" } ]
+                  [ "CloudWatchSynthetics", "SuccessPercent", "CanaryName", "${CanaryName}", { "stat": "SampleCount", "label": "Total runs" } ],
+                  [ "CloudWatchSynthetics", "Failed", "CanaryName", "${CanaryName}", { "stat": "Sum", "label": "Failed runs" } ]
                 ],
-                "view": "timeSeries", "period": 300, "region": "${AWS::Region}"
+                "view": "singleValue", "setPeriodToTimeRange": true, "region": "${AWS::Region}"
               }
             }
           ]

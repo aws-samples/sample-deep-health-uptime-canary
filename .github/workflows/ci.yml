@@ -1,0 +1,83 @@
+name: CI
+
+# Static validation only — nothing here deploys to AWS or needs credentials.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  templates:
+    name: CloudFormation templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --disable-pip-version-check cfn-lint
+      - name: cfn-lint
+        run: |
+          cfn-lint \
+            iac/cloudformation/deploy.yaml \
+            iac/cloudformation/deep-health-uptime.yaml \
+            sample-app/sample-app.yaml
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      # Blocking at the default (info) severity — the scripts are clean at that level,
+      # so any new finding is a real regression. The only suppression in the tree is an
+      # in-file SC2016 directive in deploy.sh for JMESPath backtick literals.
+      - name: shellcheck
+        run: shellcheck deploy.sh teardown.sh test/*.sh
+      - name: bash syntax check
+        run: |
+          for f in deploy.sh teardown.sh test/*.sh; do bash -n "$f"; done
+      - name: --help works for every script
+        run: |
+          for f in deploy.sh teardown.sh test/*.sh; do
+            bash "$f" --help >/dev/null || { echo "--help failed: $f"; exit 1; }
+          done
+
+  handlers:
+    name: Reference handlers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: node --check
+        run: |
+          find canary handlers -name '*.js' -not -path '*/node_modules/*' -print0 \
+            | xargs -0 -n1 node --check
+      - name: python compile
+        run: |
+          python3 -m compileall -q handlers/python test
+      - name: python syntax-only lint
+        run: |
+          pip install --disable-pip-version-check pyflakes
+          pyflakes handlers/python test || true   # advisory: handlers import optional deps
+
+  repo:
+    name: Repository self-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Canary-script sync, dashboard JSON, nested-stack parameters
+        run: python3 test/repo_checks.py

@@ -5,8 +5,16 @@
  * library's instrumented HTTP step (executeHttpStep). Using the instrumented
  * step (rather than a raw https.get) is what makes the library:
  *   - publish the request-level 2xx/4xx/5xx metrics and a per-step Duration, and
- *   - capture a HAR artifact and a step-execution summary for each run.
- * An uninstrumented https.get would publish none of those.
+ *   - write a step-execution summary (SyntheticsReport-PASSED/FAILED.json) per run.
+ * An uninstrumented https.get produces neither: no steps means no step report and
+ * no per-step Duration, which is the metric the latency alarm and dashboard use.
+ *
+ * Artifacts written to S3 per run (two objects, ~3.6 KB total):
+ *   - HttpRequestsReport.json      status + full httpTimings breakdown (DNS, TCP,
+ *                                  TLS, first byte, transfer), headers and body
+ *   - SyntheticsReport-<STATUS>.json  step list, request counts, failure stack trace
+ * There is NO .har file and NO screenshot: both come from browser page navigation,
+ * and an HTTP step never opens a page. Canary logs go to CloudWatch Logs, not S3.
  *
  * The step asserts HTTP 200 and validates the JSON health contract
  * ({"status":"ok"}); the script then asserts the FULL end-to-end response time
@@ -29,7 +37,9 @@
  *
  * This is the standalone reference script and the SOURCE OF TRUTH for the canary
  * logic. The CloudFormation template (iac/cloudformation/deep-health-uptime.yaml)
- * inlines an equivalent handler; keep the two in sync when editing.
+ * inlines the same handler; edit this file first, then mirror the change there.
+ * `python3 test/repo_checks.py` compares the two (ignoring comments) and fails if
+ * they drift — CI runs it on every push.
  */
 const synthetics = require('@aws/synthetics-puppeteer');
 const log = require('@aws/synthetics-logger');
@@ -51,13 +61,29 @@ const deepHealthCheck = async function () {
     headers: { 'X-Synthetic': 'true' },
   };
 
-  // Include the response body in the report so a failure is diagnosable; the
-  // canary run still fails on a non-2xx status (continueOnHttpStepFailure=false).
-  const stepConfig = {
+  // Capture headers + the response body into HttpRequestsReport.json so a failing
+  // run is diagnosable from the artifact alone (you see {"status":"degraded",
+  // "db":"timeout"}, not just "HTTP 503").
+  //
+  // These four flags MUST be set on the GLOBAL configuration. Passing them in
+  // executeHttpStep's per-step stepConfig is silently ignored — verified against a
+  // live run, whose report recorded "headers": "Not enabled" and an empty body while
+  // its own config dump showed "report": {} unset. Only step-scoped options
+  // (continueOnHttpStepFailure) are honoured in stepConfig.
+  //
+  // restrictedHeaders redacts credentials so they never land in S3. This canary sends
+  // only X-Synthetic, but a response can still carry Set-Cookie, and app owners who
+  // retarget this at an authenticated endpoint would otherwise persist their token.
+  synthetics.getConfiguration().setConfig({
     includeRequestHeaders: true,
     includeResponseHeaders: true,
     includeRequestBody: false,
     includeResponseBody: true,
+    restrictedHeaders: ['authorization', 'cookie', 'set-cookie', 'x-api-key', 'x-amz-security-token'],
+  });
+
+  // Step-scoped: fail the step (and so the run) on a non-2xx status.
+  const stepConfig = {
     continueOnHttpStepFailure: false,
   };
 

@@ -9,11 +9,12 @@
   },
   "dependencies": {
     "express": "4.22.3",
+    "express-rate-limit": "8.7.0",
     "pg": "8.23.0",
     "redis": "4.7.1",
     "mongodb": "6.21.0",
     "@aws-sdk/client-dynamodb": "3.1142.0",
     "@aws-sdk/client-s3": "3.1142.0"
   },
-  "comment": "This manifest lists dependencies across ALL Node reference handlers. A given handler only needs a subset: express + (pg | redis | mongodb | @aws-sdk/client-dynamodb | @aws-sdk/client-s3). external-api and opensearch use only Node built-ins (https) + express."
+  "comment": "This manifest lists dependencies across ALL Node reference handlers. A given handler only needs a subset: express + express-rate-limit + (pg | redis | mongodb | @aws-sdk/client-dynamodb | @aws-sdk/client-s3). external-api and opensearch use only Node built-ins (https) + express + express-rate-limit."
 }

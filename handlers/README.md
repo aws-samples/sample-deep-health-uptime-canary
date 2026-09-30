@@ -16,6 +16,7 @@ GET /health/deep
 - Return **HTTP 200** with `status: "ok"` only when the dependency probe succeeds within budget.
 - Return **HTTP 503** with `status: "degraded"` on any failure or timeout.
 - `latencyMs` is the measured probe round trip (useful on the dashboard).
+- Set **`Cache-Control: no-store`** on the response so a CDN/proxy never serves a cached 200 that masks a real outage (the contract test checks this).
 - Add per-dependency keys (`db`, `cache`, `upstream`, …) when you check more than one.
 
 ## Isolation rules (why these handlers look the way they do)
@@ -24,6 +25,41 @@ GET /health/deep
 2. **Hit a replica/secondary** where one exists — Aurora **reader** endpoint, DocumentDB secondary. (DynamoDB is inherently distributed.)
 3. **Bounded, dedicated resource** — a tiny separate connection pool (max 1–2) or a client with `maxAttempts: 1`, so the probe can never starve real user traffic.
 4. **Tight timeout** — 1s connect/command timeout so a slow dependency fails the check fast rather than hanging the endpoint.
+5. **Rate-limited** — 60 requests per client IP per minute, so an unauthenticated path that costs a real dependency call each time can't be used to amplify load. See below.
+
+## Rate limiting the health path
+
+The endpoint is public, unauthenticated, and **every request costs a real dependency
+call** — so an unthrottled one is a cheap amplification target. Each handler therefore
+ships an in-app limiter: `express-rate-limit` for Node, `slowapi` for Python, both
+defaulting to **60 requests per client IP per minute** (`HEALTH_RATE_LIMIT` env var).
+
+This is **defence in depth, not the primary control.** A [AWS WAF rate-based rule at
+your edge](../DEPLOYMENT.md#protecting-the-health-path-recommended) stops the traffic
+before it reaches your compute and is the control to configure first. The in-app limiter
+is what protects you if that step is skipped, or if traffic reaches the app another way.
+
+**The limit is deliberately generous.** The canary probes at most once a minute, and a
+`429` to the canary is recorded as a **failed run** — a false outage. Don't tighten the
+default below your combined probe rate (canary + load balancer health checks + any other
+monitors hitting the same path).
+
+> **Get the proxy configuration right or the limiter throttles everyone.** Both limiters
+> key on the client IP, and behind an ALB, API Gateway, or CloudFront the address your app
+> sees is the **proxy's**, not the caller's — so every request counts against one bucket
+> and the 61st request of the minute is rejected no matter who sent it, canary included.
+>
+> - **Node/Express** — `app.set('trust proxy', 1)` (already in each handler). Set it to the
+>   real number of proxy hops in front of your app, or `0` if nothing fronts it.
+> - **Python/FastAPI** — run uvicorn with `--proxy-headers --forwarded-allow-ips="<proxy IP
+>   or CIDR>"` so `request.client.host` is resolved from `X-Forwarded-For`.
+>
+> Verify after deploying: hit the endpoint from two different source IPs and confirm the
+> `RateLimit` header counts them separately (Node emits `RateLimit`/`Retry-After`).
+
+A `429` is **not** part of the deep-health contract — it means "you are being throttled,"
+not "the app is degraded" — so the handlers return `{"error": "rate limited"}` rather than
+the `{"status": "degraded"}` body, which would misreport a healthy app as down.
 
 ## Access and synthetic-traffic tagging
 

@@ -67,7 +67,7 @@ if ! aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "$
   echo "Pass the SAME --stack-name you deployed with (default is 'deep-health-uptime')." >&2
   matches="$(aws cloudformation list-stacks --region "${REGION}" \
     --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE IMPORT_COMPLETE \
-    --query "StackSummaries[?contains(StackName, 'health') || contains(StackName, 'dhealth')].StackName" \
+    --query "StackSummaries[?contains(StackName, 'health') || contains(StackName, 'canary')].StackName" \
     --output text 2>/dev/null || true)"
   if [[ -n "${matches}" && "${matches}" != "None" ]]; then
     echo "Candidate stacks in ${REGION}: ${matches}" >&2

@@ -4,6 +4,15 @@ Description: >-
   uptime monitor, optionally with the serverless sample app (DeploySampleApp=yes) or
   against your own endpoint (DeploySampleApp=no + TargetUrl).
 
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        # W3002 — "may only work with the 'package' cli command". By design: the nested
+        # TemplateURLs below are local paths that `aws cloudformation package` (or
+        # deploy.sh, which wraps it) rewrites to S3 URLs before deploying.
+        - W3002
+
 Parameters:
   DeploySampleApp:
     Type: String
@@ -21,9 +30,27 @@ Parameters:
   ScheduleExpression:
     Type: String
     Default: rate(5 minutes)
+    AllowedPattern: '^(rate\(.+\)|cron\(.+\))$'
+    ConstraintDescription: Must be a rate(...) or cron(...) expression, e.g. rate(5 minutes).
+    Description: >-
+      Canary schedule, between rate(1 minute) and rate(1 hour). If you change this,
+      set AlarmPeriodSeconds to match (see its description) — otherwise the alarms flap.
   SloMs:
     Type: Number
     Default: 3000
+    MinValue: 1
+    MaxValue: 10000
+    Description: >-
+      End-to-end latency SLO in milliseconds, INCLUDING any backend cold start. Capped at
+      10000 so the assertion always completes inside the canary run timeout.
+  AlarmPeriodSeconds:
+    Type: Number
+    Default: 300
+    AllowedValues: [ 60, 300, 900, 3600 ]
+    Description: >-
+      Alarm evaluation period in seconds. MUST match ScheduleExpression, or most periods
+      hold no run and the alarms flap: rate(1 minute)->60, rate(5 minutes)->300,
+      rate(15 minutes)->900, rate(1 hour)->3600. deploy.sh sets this for you.
   AlarmEmail:
     Type: String
     Default: ''
@@ -73,6 +100,7 @@ Resources:
           - !Ref TargetUrl
         ScheduleExpression: !Ref ScheduleExpression
         SloMs: !Ref SloMs
+        AlarmPeriodSeconds: !Ref AlarmPeriodSeconds
         AlarmEmail: !Ref AlarmEmail
         VpcSubnetIds: !Join [ ',', !Ref VpcSubnetIds ]
         CanarySecurityGroupId: !Ref CanarySecurityGroupId
