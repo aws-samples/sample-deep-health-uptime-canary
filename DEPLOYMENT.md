@@ -1,6 +1,8 @@
 # Deployment guide
 
-End-to-end steps to stand up the deep-health uptime monitoring stack.
+End-to-end steps to stand up the deep-health uptime monitoring stack — and to run it
+afterwards: the parameters reference, health-path hardening, latency troubleshooting, the
+verified cost breakdown, VPC vs non-VPC, retargeting, and teardown.
 
 ## Prerequisites
 

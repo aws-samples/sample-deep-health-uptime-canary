@@ -175,7 +175,7 @@ sample-deep-health-uptime-canary/
 
 ## Documentation
 
-- **[Deployment guide (`DEPLOYMENT.md`)](DEPLOYMENT.md)** — full deploy/teardown reference: prerequisites, the endpoint contract, all deploy methods, the parameters reference, VPC vs non-VPC (egress precheck), retargeting, and teardown.
+- **[Deployment and operations guide (`DEPLOYMENT.md`)](DEPLOYMENT.md)** — prerequisites, the endpoint contract, all deploy methods, the [parameters reference](DEPLOYMENT.md#parameters-reference), [protecting the health path](DEPLOYMENT.md#protecting-the-health-path-recommended), [diagnosing high latency](DEPLOYMENT.md#seeing-why-latency-is-high--cold-start-vs-query-time), the [verified cost breakdown](DEPLOYMENT.md#cost), VPC vs non-VPC (egress precheck), retargeting, and teardown.
 - **[`handlers/`](handlers/)** — reference deep-health handlers (Node.js and Python) for seven backends each, with dependency isolation baked in.
 
 ## Security
