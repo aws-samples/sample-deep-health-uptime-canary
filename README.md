@@ -54,7 +54,7 @@ Your workload runs in a VPC in both modes; only the **canary's** placement chang
 
 ## Quick start
 
-Don't have an app handy? Deploy the optional [`sample-app/`](sample-app/) — a fully serverless, pay-per-request target (Amazon API Gateway → AWS Lambda → Amazon DynamoDB) that costs **≈ $0 at rest**. Otherwise, point the canary at your own endpoint (any path that returns the deep-health contract below — `/health/deep` is just the convention used throughout this repo).
+Don't have an app handy? Deploy the optional [`sample-app/`](sample-app/) — a fully serverless, pay-per-request target (Amazon API Gateway → AWS Lambda → Amazon DynamoDB) that costs **≈ $0 idle** — though once a canary is probing it, its two diagnostic EMF metrics run up to **$0.60/month** past your account's 10-metric free tier ([details](sample-app/README.md#cost--safe-to-leave-running)). Otherwise, point the canary at your own endpoint (any path that returns the deep-health contract below — `/health/deep` is just the convention used throughout this repo).
 
 Clone the repo, then run the guided `deploy.sh` — it packages the nested templates to S3 and deploys the stack in one step. Run it with **no flags** and it prompts for stack name, sample-app-or-your-URL, public-or-private, schedule, and alarm email:
 
@@ -151,6 +151,8 @@ Exactly one thing in your application: add a `GET` deep-health route — at any 
 ```
 
 Copy the reference handler closest to your stack from [`handlers/`](handlers/) and adapt the probe line. Swapping the backend is just swapping the probe (`SELECT 1` on an Aurora reader → DynamoDB `DescribeTable` → Redis `PING`, and so on). Reference handlers ship for **Node.js and Python** across seven backends each (Aurora/RDS, DynamoDB, DocumentDB, ElastiCache, OpenSearch, Amazon S3, and an external API), with dependency isolation baked in.
+
+**One thing to decide while you're in there:** this route is **public and unauthenticated** by design — the canary probes it over HTTPS with no credentials — so keep the response coarse (no stack traces, hostnames, or connection strings) and rate-limit the path. The handler you copy already throttles itself at 60 requests per client IP per minute; an AWS WAF rate-based rule at your edge is the control to add on top, and a shared-secret header is an option if you'd rather not leave it open. All three are covered in [DEPLOYMENT.md → Protecting the health path](DEPLOYMENT.md#protecting-the-health-path-recommended).
 
 ## Repository layout
 
