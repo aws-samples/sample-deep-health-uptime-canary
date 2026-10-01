@@ -1,6 +1,6 @@
 # Deep Health Uptime Canary
 
-**Measure true end-to-end application uptime on AWS** — using Amazon CloudWatch Synthetics canaries pointed at a dedicated, isolated deep health endpoint that reaches your backend and back. Compute- and backend-agnostic, deployable in minutes, and extensible to almost any stack.
+**Measure true end-to-end application uptime on AWS** — using Amazon CloudWatch Synthetics canaries pointed at a dedicated deep health endpoint that reaches your backend and back. Compute- and backend-agnostic, deployable in minutes, and extensible to almost any stack.
 
 > "Healthy" isn't the same as "up." A load balancer health check tells you a container is alive; it doesn't tell you a real request can reach your backend and return within a latency budget. This solution measures the real thing — and turns it into an SLA percentage on your dashboard.
 
@@ -24,7 +24,7 @@
 Most teams monitoring a public application rely on shallow load balancer or container health checks (which miss backend and dependency failures), or hand-roll a fragile custom prober (hard to isolate from real traffic). This solution packages the **correct** end-to-end uptime pattern as a reusable asset:
 
 - **Outside-in canary** that probes your endpoint exactly like a real user — through DNS, CDN, TLS, AWS WAF, the load balancer, your application, and its backend dependency.
-- **A dedicated deep health endpoint** doing a bounded, read-only dependency check on a replica/reader, isolated so monitoring never disturbs real users.
+- **A dedicated deep health endpoint** doing a bounded, read-only dependency check on a replica/reader. The probe deliberately travels the same edge, compute, and backend path as real traffic — that is what makes the measurement honest — but it runs on its own route, with its own bounded client and a trivially cheap read-only query, so it can never starve the resources real requests depend on and never touches user data ([what "isolated" does and doesn't mean](handlers/README.md#what-isolated-does-and-doesnt-mean)).
 - **A real SLA %** computed from the run-level `SuccessPercent` metric (its average over any window equals the fraction of runs that passed × 100) on an Amazon CloudWatch dashboard (or Amazon Managed Grafana), with Amazon SNS alerts. It is exact across days and months, and immune to run-cadence changes.
 
 **Why not just use existing health checks?** Load balancer and container health checks only confirm a process is alive and a port is open — they don't exercise your backend. Amazon Route 53 health checks probe from outside but typically hit a shallow endpoint, not a real dependency path. A hand-rolled cron prober means reinventing scheduling, retries, metric publishing, alerting, and traffic isolation. This solution gets the outside-in vantage *and* a genuine end-to-end dependency check, packaged as reusable infrastructure-as-code.
@@ -180,7 +180,7 @@ sample-deep-health-uptime-canary/
 
 ## Security
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for how to report security issues. The canary uses least-privilege IAM and holds no backend credentials — it only makes the HTTP call (the deep-health handler is what reads from a replica/reader with a bounded client and tight timeout). The canary tags its traffic as synthetic (`X-Synthetic: true`) so you can exclude it from real user metrics. The health path is rate-limited in two layers: every reference handler throttles it in-app (60 requests per client IP per minute by default), and an AWS WAF rate-based rule at your edge (on your ALB / API Gateway / CloudFront) is recommended as the primary control — see [DEPLOYMENT.md](DEPLOYMENT.md#protecting-the-health-path-recommended).
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for how to report security issues. The canary uses least-privilege IAM and holds no backend credentials — it only makes the HTTP call (the deep-health handler is what reads from a replica/reader with a bounded client and tight timeout). The canary tags its traffic as synthetic (`X-Synthetic: true`) so you can exclude it from real user metrics — it's a label, not an action: your metrics pipeline has to do the filtering. The health path is rate-limited in two layers: every reference handler throttles it in-app (60 requests per client IP per minute by default), and an AWS WAF rate-based rule at your edge (on your ALB / API Gateway / CloudFront) is recommended as the primary control — see [DEPLOYMENT.md](DEPLOYMENT.md#protecting-the-health-path-recommended).
 
 ## License
 

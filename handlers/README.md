@@ -27,6 +27,43 @@ GET /health/deep
 4. **Tight timeout** — 1s connect/command timeout so a slow dependency fails the check fast rather than hanging the endpoint.
 5. **Rate-limited** — 60 requests per client IP per minute, so an unauthenticated path that costs a real dependency call each time can't be used to amplify load. See below.
 
+### What "isolated" does and doesn't mean
+
+Be precise about this when you explain the pattern to a team, because it is easy to
+overstate.
+
+**Deliberately shared** — the probe goes through the *same* DNS, CDN, TLS, AWS WAF, load
+balancer, and application compute as real users. That is the entire point: a probe on its
+own private path would not measure what users experience. So the probe does consume a
+little production capacity — a worker thread on ECS/EC2/EKS, an invocation (and possibly
+concurrency) on Lambda. At a 1-minute cadence that's ~1,440 requests/day: negligible for
+any real workload, but **not zero**. Budget for it the same way you budget for your load
+balancer's own health checks.
+
+The backend is shared too, with one qualification: the probe reads from a replica/reader
+rather than the primary **where the backend has that split** (Aurora reader, DocumentDB
+secondary). But a reader is still a live node that may also serve real read traffic, and
+several backends have no such split for a liveness probe at all — a DynamoDB
+`DescribeTable`, a Redis `PING`, an OpenSearch `GET /_cluster/health` all land on the same
+resource your application uses.
+
+**Bounded, not eliminated** — so contention is real; what the rules above guarantee is that
+it stays negligible and **cannot escalate**:
+
+- a dedicated route, so no user-facing transaction and no user data is ever involved;
+- the primary is spared where a reader exists;
+- the handler's own small pool (max 1–2), so the probe can never exhaust the pool real
+  requests depend on — the failure mode that actually takes applications down;
+- a trivially cheap read-only query — `SELECT 1`, `DescribeTable`, `PING` — never a scan or
+  a write, so the work asked of the backend is close to nothing;
+- a tight timeout, so a sick dependency fails the probe fast instead of tying up a worker.
+
+So the accurate claim is **"monitoring cannot starve the resources real requests depend on,
+and never touches user data"** — not "monitoring doesn't contend with real traffic," and
+not "monitoring stays off the user path." Both of those are false. And see the
+`X-Synthetic` note below: the header lets you keep probes out of your real-user metrics,
+but your pipeline has to do the filtering.
+
 ## Rate limiting the health path
 
 The endpoint is public, unauthenticated, and **every request costs a real dependency
