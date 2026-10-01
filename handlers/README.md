@@ -27,6 +27,15 @@ GET /health/deep
 4. **Tight timeout** — 1s connect/command timeout so a slow dependency fails the check fast rather than hanging the endpoint.
 5. **Rate-limited** — 60 requests per client IP per minute, so an unauthenticated path that costs a real dependency call each time can't be used to amplify load. See below.
 
+> **Don't point your load balancer at this route.** Keep the target-group / container health
+> check on a shallow path that only proves the process is up. A health check is a *control
+> signal*: when it fails, the balancer deregisters the target. Make a deep check that signal
+> and one slow dependency fails every target at once, so the balancer pulls your whole fleet
+> out of rotation — turning a degraded backend into a hard outage, and triggering task or
+> instance replacement on top. This route exists for out-of-band *measurement*, which has no
+> authority to take anything down. See the Amazon Builders' Library,
+> [Implementing health checks](https://aws.amazon.com/builders-library/implementing-health-checks/).
+
 ### What "isolated" does and doesn't mean
 
 Be precise about this when you explain the pattern to a team, because it is easy to
